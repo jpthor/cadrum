@@ -10,7 +10,7 @@ const COLORED_BOX_STEP: &str = "steps/colored_box.step";
 
 fn read_colored_box() -> Vec<Solid> {
 	let data = fs::read(COLORED_BOX_STEP).expect("steps/colored_box.step should exist");
-	cadrum::read_step(&mut data.as_slice()).expect("read_step should succeed")
+	cadrum::Solid::read_step(&mut data.as_slice()).expect("read_step should succeed")
 }
 
 fn colormap_len(shape: &[Solid]) -> usize {
@@ -19,14 +19,14 @@ fn colormap_len(shape: &[Solid]) -> usize {
 
 fn roundtrip_bin(shape: &[Solid]) -> Vec<Solid> {
 	let mut buf = Vec::new();
-	cadrum::write_brep_binary(shape, &mut buf).expect("write_brep_binary should succeed");
-	cadrum::read_brep_binary(&mut buf.as_slice()).expect("read_brep_binary should succeed")
+	cadrum::Solid::write_brep_binary(shape, &mut buf).expect("write_brep_binary should succeed");
+	cadrum::Solid::read_brep_binary(&mut buf.as_slice()).expect("read_brep_binary should succeed")
 }
 
 fn roundtrip_text(shape: &[Solid]) -> Vec<Solid> {
 	let mut buf = Vec::new();
-	cadrum::write_brep_text(shape, &mut buf).expect("write_brep_text should succeed");
-	cadrum::read_brep_text(&mut buf.as_slice()).expect("read_brep_text should succeed")
+	cadrum::Solid::write_brep_text(shape, &mut buf).expect("write_brep_text should succeed");
+	cadrum::Solid::read_brep_text(&mut buf.as_slice()).expect("read_brep_text should succeed")
 }
 
 // ── binary tests ─────────────────────────────────────────────────────────────
@@ -39,8 +39,8 @@ fn bin_write_then_read_preserves_colors() {
 
 	assert_eq!(colormap_len(&reloaded), colormap_len(&original), "color count should be preserved (binary)");
 
-	let original_colors: Vec<Color> = original.iter().flat_map(|s| s.face_iter()).filter_map(|f| original.iter().find_map(|s| s.colormap().get(&f.tshape_id()).copied())).collect();
-	let reloaded_colors: Vec<Color> = reloaded.iter().flat_map(|s| s.face_iter()).filter_map(|f| reloaded.iter().find_map(|s| s.colormap().get(&f.tshape_id()).copied())).collect();
+	let original_colors: Vec<Color> = original.iter().flat_map(|s| s.iter_face()).filter_map(|f| original.iter().find_map(|s| s.colormap().get(&f.id()).copied())).collect();
+	let reloaded_colors: Vec<Color> = reloaded.iter().flat_map(|s| s.iter_face()).filter_map(|f| reloaded.iter().find_map(|s| s.colormap().get(&f.id()).copied())).collect();
 
 	assert_eq!(original_colors, reloaded_colors, "RGB values should be identical (binary)");
 }
@@ -76,8 +76,8 @@ fn text_write_then_read_preserves_colors() {
 
 	assert_eq!(colormap_len(&reloaded), colormap_len(&original), "color count should be preserved (text)");
 
-	let original_colors: Vec<Color> = original.iter().flat_map(|s| s.face_iter()).filter_map(|f| original.iter().find_map(|s| s.colormap().get(&f.tshape_id()).copied())).collect();
-	let reloaded_colors: Vec<Color> = reloaded.iter().flat_map(|s| s.face_iter()).filter_map(|f| reloaded.iter().find_map(|s| s.colormap().get(&f.tshape_id()).copied())).collect();
+	let original_colors: Vec<Color> = original.iter().flat_map(|s| s.iter_face()).filter_map(|f| original.iter().find_map(|s| s.colormap().get(&f.id()).copied())).collect();
+	let reloaded_colors: Vec<Color> = reloaded.iter().flat_map(|s| s.iter_face()).filter_map(|f| reloaded.iter().find_map(|s| s.colormap().get(&f.id()).copied())).collect();
 
 	assert_eq!(original_colors, reloaded_colors, "RGB values should be identical (text)");
 }

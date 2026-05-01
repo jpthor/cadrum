@@ -1,13 +1,12 @@
 //! Build a chijin (hand drum from Amami Oshima) with colors, boolean ops, and SVG export.
 
-use cadrum::{Color, Compound, Edge, ProfileOrient, Solid};
-use glam::DVec3;
+use cadrum::{Color, Compound, DVec3, Edge, ProfileOrient, Solid};
 use std::f64::consts::PI;
 
 pub fn chijin() -> Result<Solid, cadrum::Error> {
 	// ── Body (cylinder): r=15, h=8, centered at origin (z=-4..+4) ────────
 	let cylinder = Solid::cylinder(15.0, DVec3::Z, 8.0)
-		.translate(DVec3::new(0.0, 0.0, -4.0))
+		.translate(DVec3::Z * -4.0)
 		.color("#999");
 
 	// ── Sheet: closed polygon in the XZ plane (y=0), swept 360° around Z
@@ -32,10 +31,10 @@ pub fn chijin() -> Result<Solid, cadrum::Error> {
 	let block_proto = Solid::cube(2.0, 8.0, 1.0)
 		.translate(DVec3::new(-1.0, -4.0, -0.5))
 		.rotate_z(60.0_f64.to_radians())
-		.translate(DVec3::new(0.0, 15.0, 0.0));
+		.translate(DVec3::Y * 15.0);
 
 	// ── Lacing holes: thin cylinders through each block ──────────────────
-	let hole_proto = Solid::cylinder(0.7, DVec3::new(10.0, 0.0, 30.0), 30.0)
+	let hole_proto = Solid::cylinder(0.7, DVec3::X * 10.0 + DVec3::Z * 30.0, 30.0)
 		.translate(DVec3::new(-5.0, 16.0, -15.0));
 
 	// Distribute N blocks and holes evenly around Z, each block in a rainbow color
@@ -58,15 +57,12 @@ fn main() -> Result<(), cadrum::Error> {
 	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
 	let result = [chijin()?];
 
-	let step_path = format!("{example_name}.step");
-	let mut f = std::fs::File::create(&step_path).expect("failed to create STEP file");
-	cadrum::write_step(&result, &mut f).expect("failed to write STEP");
-	println!("wrote {step_path}");
+	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
+	Solid::write_step(&result, &mut f).expect("failed to write STEP");
 
-	let svg_path = format!("{example_name}.svg");
-	let mut f = std::fs::File::create(&svg_path).expect("failed to create SVG file");
-	cadrum::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 1.0), true, false, &mut f)).expect("failed to write SVG");
-	println!("wrote {svg_path}");
+	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
+	Solid::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::ONE, DVec3::Z, true, false, &mut f)).expect("failed to write SVG");
 
+	println!("wrote {example_name}.step / {example_name}.svg");
 	Ok(())
 }

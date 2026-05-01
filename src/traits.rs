@@ -7,9 +7,8 @@
 //!             └─  Wire    ──  EdgeStruct   (pub(crate))
 //! ```
 //!
-//! `Face` 型はトレイトを持たない opaque な query handle で、`tshape_id` のみ
-//! を inherent method として公開する。`SolidStruct::type Face` の bound にも
-//! 何も付かない。
+//! `Face` 型は `FaceStruct` トレイトに `id` / `project` / `iter_edge` を持つ。
+//! `SolidStruct::type Face: FaceStruct` で結合される。
 //!
 //! `Edge` / `Vec<Edge>` の対称関係は `Solid` / `Vec<Solid>` と同じ:
 //!   - 単一エッジ向け constructor は `EdgeStruct` (cube/sphere に対応)
@@ -28,7 +27,7 @@
 //!
 //! - `SolidStruct: Sized + Clone + Compound` (pub(crate)): backend implementation trait.
 //!   Adds Solid-only operations (constructors, topology accessors, boolean primitives).
-//!   build_delegation.rs parses this and generates pub inherent methods on Solid,
+//!   examples/codegen.rs parses this and generates pub inherent methods on Solid,
 //!   walking the supertrait chain so all `Compound` and `Transform` methods are also
 //!   exposed inherently. Trait name follows `<Type>Struct` convention (SolidStruct → Solid).
 //!
@@ -45,32 +44,33 @@
 //!
 //! ```text
 //!   EdgeStruct       ← 単独。下位を一切知らない
-//!   SolidStruct      ← type Edge: EdgeStruct;  type Face;  (Face は bound 無し)
-//!   IoModule         ← type Solid: SolidStruct;
+//!   FaceStruct       ← type Edge: EdgeStruct;
+//!   SolidStruct      ← type Edge: EdgeStruct;  type Face: FaceStruct;
+//!                       I/O メソッド (read_step / write_step / mesh など) も SolidStruct に同居
 //! ```
 //!
 //! 下位（Edge/Face）→ 上位（Solid）への参照は持たせない。例えば「Edge を sweep して
 //! Solid を作る」操作は `EdgeStruct::sweep` ではなく `SolidStruct::sweep(profile, spine)`
 //! として上位側に置き、ヒエラルキーを保つ。逆向き参照を導入する瞬間に associated type
-//! の循環や Backend バンドルトレイトが必要になり、build_delegation.rs のテキスト処理が
+//! の循環や Backend バンドルトレイトが必要になり、examples/codegen.rs のテキスト処理が
 //! 追従できなくなる。
 //!
-//! ### 命名と build_delegation の対応
+//! ### 命名と codegen の対応
 //!
-//! - `SolidStruct` の `type Edge` / `type Face`、`IoModule` の `type Solid` という名前は
-//!   build_delegation.rs の `TYPE_MAP` と一致させること。`Self::Edge` / `Self::Face` /
-//!   `Self::Solid` は生成時にバックエンドの具象型名（`Edge` / `Face` / `Solid`）へ
-//!   置換され、`lib.rs` の `pub use occt::{Solid, Edge, Face};` により実体に解決される。
-//! - 戻り型・引数型は `Vec<Self::Edge>`、`impl IntoIterator<Item = &'a Self::Solid>` の
-//!   ように常に関連型経由で書く。
+//! - `SolidStruct` の `type Edge` / `type Face` という名前は examples/codegen.rs の
+//!   `TYPE_MAP` と一致させること。`Self::Edge` / `Self::Face` は生成時に
+//!   バックエンドの具象型名（`Edge` / `Face`）へ置換され、`lib.rs` の
+//!   `pub use occt::{Solid, Edge, Face};` により実体に解決される。
+//! - 戻り型・引数型は `Vec<Self::Edge>`、`impl IntoIterator<Item = &'a Self>` の
+//!   ように常に関連型 / Self 経由で書く（具象型名を直接書かない）。
 //! - associated type 宣言（`type Foo: Bound;`）はパーサーが行頭でスキップするので、
 //!   メソッドと同じインデントで 1 行に収めること。
 //!
-//! パーサー挙動と制約（build_delegation.rs — 行ベースのテキスト処理）:
+//! パーサー挙動と制約（examples/codegen.rs — 行ベースのテキスト処理）:
 //!
 //! トレイトヘッダ:
 //! - `pub trait Foo: A + B + C {` から名前と supertrait リスト（`+` 区切り）を抽出する
-//! - `Foo` が `Struct`/`Module` サフィックスを持つトレイトの supertrait に出現した場合、
+//! - `Foo` が `Struct` サフィックスを持つトレイトの supertrait に出現した場合、
 //!   `Foo` のメソッドも親側の inherent impl に取り込まれる（再帰的に祖先まで辿る）
 //! - 解析対象トレイト一覧に存在しない名前（`Sized`, `Clone`, ライフタイム束縛 `'a` 等）は
 //!   黙って無視される
@@ -118,12 +118,12 @@ use glam::{DMat3, DQuat, DVec3};
 /// require an import).
 ///
 /// For `Solid` / `Edge` themselves the forwarders are unnecessary —
-/// `build_delegation.rs` walks the supertrait chain and emits inherent
+/// `examples/codegen.rs` walks the supertrait chain and emits inherent
 /// methods, so no trait import is needed on the single types.
 ///
 /// TODO(#90): the per-method forwarders in `Compound` / `Wire` are
 /// mechanical and could be generated. A future refactor could extend
-/// `build_delegation.rs` (or introduce a proc-macro) to auto-emit
+/// `examples/codegen.rs` (or introduce a proc-macro) to auto-emit
 /// `fn foo(self, ..) -> Self { <Self as Transform>::foo(self, ..) }` for
 /// every method of a referenced trait, so that Transform's surface is
 /// listed exactly once in this file. Not urgent — see the issue for
@@ -277,14 +277,18 @@ pub enum BSplineEnd {
 /// Methods on `Wire` therefore have meaningful semantics for both a single
 /// edge and an ordered edge list:
 ///
-/// - `start_point` / `start_tangent` — the wire's starting position/direction.
-///   For a single edge, the edge's first point and tangent.
-///   For a `Vec<Edge>`, the first edge's start.
+/// - `start_point` / `end_point` / `start_tangent` / `end_tangent` — the
+///   wire's endpoint positions and tangent directions.
+///   For a single edge, the edge's first/last point and tangent.
+///   For a `Vec<Edge>`, the first edge's start and the last edge's end.
 /// - `is_closed` — does the geometry form a closed loop?
 ///   For a single edge, whether start == end (e.g. a circle).
 ///   For a `Vec<Edge>`, whether the first edge's start equals the last edge's end.
 /// - `approximation_segments` — polyline approximation. For a wire, all
 ///   sub-edges' segments are concatenated in order.
+/// - `project` — closest point on the wire to a given world point, with the
+///   unit tangent at that point. For a `Vec<Edge>`, projects onto every
+///   sub-edge and returns the result with the smallest distance to `p`.
 ///
 /// Spatial transforms live on the (crate-private) supertrait `Transform`.
 /// Since `Transform` is not re-exported from the crate root, users cannot
@@ -293,22 +297,28 @@ pub enum BSplineEnd {
 /// alone enables `vec_of_edges.translate(...)` etc.
 ///
 /// As with `Compound`, `EdgeStruct: Wire` so users of `Edge` get these
-/// methods inherently via `build_delegation.rs`; the `use` import is only
+/// methods inherently via `examples/codegen.rs`; the `use` import is only
 /// required when chaining on `Vec<Edge>` / `[Edge; N]`.
 pub trait Wire: Transform {
 	type Elem: EdgeStruct;
 
 	fn start_point(&self) -> DVec3;
+	fn end_point(&self) -> DVec3;
 	fn start_tangent(&self) -> DVec3;
+	fn end_tangent(&self) -> DVec3;
 	fn is_closed(&self) -> bool;
 	fn approximation_segments(&self, tolerance: f64) -> Vec<DVec3>;
+	/// Project `p` onto the wire and return `(closest_point, unit_tangent)`.
+	/// The tangent follows the curve's native parameter direction.
+	///
+	/// An empty wire returns `(DVec3::ZERO, DVec3::ZERO)`, matching the
+	/// silent-zero convention of `start_point` / `start_tangent`. A single
+	/// `Edge` that lacks a 3D geometric curve (i.e. FFI-level failure,
+	/// which cadrum-built edges never produce) panics — that case
+	/// indicates a bug, not a degenerate user input.
+	fn project(&self, p: DVec3) -> (DVec3, DVec3);
 
-	// --- Transform forwarders ---
-	// Let `use cadrum::Wire;` alone pull the Transform surface into scope.
-	// TODO(#90): auto-generate these from `Transform` (extend
-	// build_delegation.rs or introduce a proc-macro) so the list doesn't have
-	// to be mirrored by hand. See the `Transform` doc comment for the design
-	// note. Not urgent.
+	////////// codegen.rs
 	fn translate(self, translation: DVec3) -> Self { <Self as Transform>::translate(self, translation) }
 	fn rotate(self, axis_origin: DVec3, axis_direction: DVec3, angle: f64) -> Self { <Self as Transform>::rotate(self, axis_origin, axis_direction, angle) }
 	fn rotate_x(self, angle: f64) -> Self { <Self as Transform>::rotate_x(self, angle) }
@@ -331,6 +341,12 @@ pub trait Wire: Transform {
 /// `Error::InvalidEdge(String)` with a message that identifies the failing
 /// constructor and the offending parameters.
 pub trait EdgeStruct: Sized + Clone + Wire {
+	/// Stable, backend-defined identity for this edge. Two `Edge` values
+	/// returning the same `id()` refer to the same topology element.
+	/// Use to compare edges across `Solid::iter_edge()` / `Face::iter_edge()`
+	/// (e.g. `face.iter_edge().any(|e| e.id() == edge.id())`).
+	fn id(&self) -> u64;
+
 	/// Construct a single helical edge on a cylindrical surface centered at
 	/// the world origin.
 	///
@@ -401,6 +417,49 @@ pub trait EdgeStruct: Sized + Clone + Wire {
 	fn bspline<'a>(points: impl IntoIterator<Item = &'a DVec3>, end: BSplineEnd) -> Result<Self, Error>;
 }
 
+/// Backend-independent face trait (pub(crate) — not exposed to users).
+///
+/// `Face` is a query handle for surfaces in a solid. Used to read identity
+/// (for colormap / boolean history matching) and to project external 3D
+/// points onto the face for snap-to-surface workflows.
+///
+/// examples/codegen.rs generates `impl Face { pub fn ... }` from this trait
+/// so callers reach the methods inherently as `face.id()` / `face.project(p)`.
+pub trait FaceStruct: Sized {
+	type Edge: EdgeStruct;
+
+	/// Stable, backend-defined identity for this face. Two `Face` values
+	/// returning the same `id()` refer to the same topology element. Used
+	/// to look up entries in `Solid::colormap` or to match faces against
+	/// boolean / clean operation history. The numeric value itself has no
+	/// meaning beyond equality / hash use.
+	fn id(&self) -> u64;
+
+	/// Project a 3D point onto this face. Returns `(closest_point,
+	/// outward_normal)`. Sister of `Wire::project` which returns `(closest,
+	/// tangent)` on a 1D curve.
+	///
+	/// The closest hit respects the face's trim — projection lands on the
+	/// actual face area, not its underlying infinite surface. To project
+	/// onto a full solid, iterate `Solid::iter_face()` and call `project`
+	/// on each face; the caller picks the smallest-distance face and keeps
+	/// the face object for follow-up queries (e.g. `face.id()` for
+	/// colormap lookup).
+	///
+	/// `outward_normal` is the zero vector when the surface evaluator
+	/// cannot define a normal at the closest hit (degenerate surface
+	/// point); callers can detect this case via `normal.length() == 0`.
+	fn project(&self, p: DVec3) -> (DVec3, DVec3);
+
+	/// Iterate this face's boundary edges (outer wire and any inner wires).
+	/// Each edge appears once even when shared between wires. Backends may
+	/// cache the result internally; re-calls are expected to be cheap.
+	///
+	/// Use with `Edge::id()` to test face/edge incidence:
+	/// `face.iter_edge().any(|e| e.id() == edge.id())`.
+	fn iter_edge(&self) -> impl Iterator<Item = &Self::Edge> + '_;
+}
+
 /// Backend-independent solid trait (pub(crate) — not exposed to users).
 ///
 /// `Solid`-specific operations only. The shared methods (transforms, queries,
@@ -408,14 +467,22 @@ pub trait EdgeStruct: Sized + Clone + Wire {
 /// supertrait bound.
 ///
 
-/// build_delegation.rs generates `impl Solid { pub fn ... }` from this trait
+/// examples/codegen.rs generates `impl Solid { pub fn ... }` from this trait
 /// and walks the supertrait chain to expose `Compound` methods inherently as well.
 ///
 /// Associated types `Edge`/`Face` keep this trait backend-independent: each
 /// backend (occt / pure) binds them to its own concrete types in the impl.
 pub trait SolidStruct: Sized + Clone + Compound {
 	type Edge: EdgeStruct;
-	type Face;
+	type Face: FaceStruct;
+
+	// --- Identity ---
+	/// Stable, backend-defined identity for this solid. Two `Solid` values
+	/// returning the same `id()` refer to the same topology element.
+	/// translate / rotate / color preserve this id; scale / mirror / Clone
+	/// rebuild topology and produce a fresh id. Distinct from the ids of
+	/// the solid's contained faces / edges (each sub-shape has its own).
+	fn id(&self) -> u64;
 
 	// --- Constructors ---
 	fn cube(x: f64, y: f64, z: f64) -> Self;
@@ -425,15 +492,66 @@ pub trait SolidStruct: Sized + Clone + Compound {
 	fn torus(r1: f64, r2: f64, axis: DVec3) -> Self;
 	fn half_space(plane_origin: DVec3, plane_normal: DVec3) -> Self;
 
-	// --- Topology ---
-	fn faces(&self) -> Vec<Self::Face>;
-	fn edges(&self) -> Vec<Self::Edge>;
+	// --- Topology iteration ---
+	/// Iterate this solid's unique edges. Each OCCT edge appears once even
+	/// when shared between faces. Backends may cache the result internally;
+	/// re-calls are expected to be cheap.
+	fn iter_edge(&self) -> impl Iterator<Item = &Self::Edge> + '_;
+	/// Iterate this solid's faces. Backends may cache the result internally.
+	fn iter_face(&self) -> impl Iterator<Item = &Self::Face> + '_;
+	/// Iterate face-derivation pairs `[post_id, src_id]` from the most recent
+	/// boolean operation that produced this Solid (or its source chain, while
+	/// it stays through translate/rotate/color). Empty after primitive/builder
+	/// construction, I/O read, scale/mirror, or Clone.
+	fn iter_history(&self) -> impl Iterator<Item = [u64; 2]> + '_;
 
 	/// Extrude a closed profile wire along a direction vector to form a solid.
 	///
 	/// Internally builds a face from the wire and uses `BRepPrimAPI_MakePrism`.
 	/// Fails if the profile is empty, not closed, or the direction is zero-length.
 	fn extrude<'a>(profile: impl IntoIterator<Item = &'a Self::Edge>, dir: DVec3) -> Result<Self, Error> where Self::Edge: 'a;
+
+	/// Hollow this solid into a thin-walled shell by removing `open_faces`
+	/// (they become openings) and building a wall of signed `thickness` along
+	/// each remaining face. Wraps OCCT's `BRepOffsetAPI_MakeThickSolid`.
+	///
+	/// `thickness` is the wall thickness with direction encoded in its sign:
+	/// negative → wall grows inward (carve cavity inside the original volume),
+	/// positive → wall grows outward (shell sits outside the original surface,
+	/// enclosing the original as its inner boundary).
+	///
+	/// `open_faces` must be faces of `self` (e.g. selected via `self.iter_face()`).
+	/// When `open_faces` is empty, `BRepOffsetAPI_MakeThickSolid` degenerates to
+	/// a plain offset shape (no cavity) because it needs at least one removed
+	/// face to build the inner wall. The wrapper detects this and falls back to
+	/// `BRepOffsetAPI_MakeOffsetShape` + `BRepBuilderAPI_MakeSolid`, assembling
+	/// an outer shell and a reversed inner shell into a sealed multi-shell
+	/// solid with an internal void (the void is inaccessible from outside).
+	/// Fails on OCCT rejection (self-intersecting offset at sharp corners, etc).
+	fn shell<'a>(&self, thickness: f64, open_faces: impl IntoIterator<Item = &'a Self::Face>) -> Result<Self, Error> where Self::Face: 'a;
+
+	/// Round the given edges of `self` with a uniform radius. Edges are
+	/// typically selected via `self.iter_edge().filter(...)`.
+	///
+	/// Wraps `BRepFilletAPI_MakeFillet`. Fails (`Error::FilletFailed`) if
+	/// the radius is too large for the local geometry, if tangent
+	/// discontinuity prevents OCCT from building the fillet surface, or
+	/// if an edge not belonging to `self` is passed.
+	///
+	/// Empty `edges` is a no-op and returns a clone of `self` — handy when
+	/// a selector chain legitimately yields zero edges.
+	fn fillet_edges<'a>(&self, radius: f64, edges: impl IntoIterator<Item = &'a Self::Edge>) -> Result<Self, Error> where Self::Edge: 'a;
+
+	/// Chamfer (bevel) the given edges of `self` with a uniform distance.
+	/// Edges are typically selected via `self.iter_edge().filter(...)`.
+	///
+	/// Wraps `BRepFilletAPI_MakeChamfer`. The chamfer plane is symmetric —
+	/// the same `distance` is taken off along each of the two faces
+	/// adjacent to the edge. Fails (`Error::ChamferFailed`) under the same
+	/// conditions as `fillet_edges`.
+	///
+	/// Empty `edges` is a no-op and returns a clone of `self`.
+	fn chamfer_edges<'a>(&self, distance: f64, edges: impl IntoIterator<Item = &'a Self::Edge>) -> Result<Self, Error> where Self::Edge: 'a;
 
 	// --- Sweep ---
 	/// Sweep a closed profile wire (= ordered edge list) along a spine wire
@@ -472,16 +590,34 @@ pub trait SolidStruct: Sized + Clone + Compound {
 	/// `periodic=true`, producing a torus. When `periodic=false` the U-ends are
 	/// capped with planar faces, producing a pipe.
 	///
-	/// Internally builds a `Geom_BSplineSurface` via `GeomAPI_PointsToBSplineSurface::Interpolate`
-	/// on an augmented grid (first row/column duplicated at the end to satisfy
-	/// the `SetUPeriodic`/`SetVPeriodic` pole-matching precondition), then
-	/// wraps the surface in a face, caps it if needed, sews, and makes a solid.
-	fn bspline<const M: usize, const N: usize>(grid: [[DVec3; N]; M], periodic: bool) -> Result<Self, Error>;
+	/// Internally builds a `Geom_BSplineSurface` via tensor-product periodic
+	/// curve interpolation: per-V-column then per-U-row `GeomAPI_Interpolate`
+	/// with explicit uniform parameters. Yields C^(degree-1) continuity at
+	/// both seams. The closure `point(i, j)` is called for `i ∈ 0..u`,
+	/// `j ∈ 0..v` to produce the M×N control grid, where `u` is the
+	/// toroidal direction (closed iff `u_periodic`) and `v` is the
+	/// cross-section direction (always closed).
+	fn bspline(u: usize, v: usize, u_periodic: bool, point: impl Fn(usize, usize) -> DVec3) -> Result<Self, Error>;
 
-	// --- Boolean primitives (consumed by Compound::*_with_metadata wrappers) ---
-	fn boolean_union<'a, 'b>(a: impl IntoIterator<Item = &'a Self>, b: impl IntoIterator<Item = &'b Self>) -> Result<(Vec<Self>, [Vec<u64>; 2]), Error> where Self: 'a + 'b;
-	fn boolean_subtract<'a, 'b>(a: impl IntoIterator<Item = &'a Self>, b: impl IntoIterator<Item = &'b Self>) -> Result<(Vec<Self>, [Vec<u64>; 2]), Error> where Self: 'a + 'b;
-	fn boolean_intersect<'a, 'b>(a: impl IntoIterator<Item = &'a Self>, b: impl IntoIterator<Item = &'b Self>) -> Result<(Vec<Self>, [Vec<u64>; 2]), Error> where Self: 'a + 'b;
+	// --- Boolean primitives (consumed by Compound::union/subtract/intersect wrappers) ---
+	// Per-result-Solid face derivation history is attached to each Solid via
+	// `Solid::iter_history()`; no separate metadata channel.
+	fn boolean_union<'a, 'b>(a: impl IntoIterator<Item = &'a Self>, b: impl IntoIterator<Item = &'b Self>) -> Result<Vec<Self>, Error> where Self: 'a + 'b;
+	fn boolean_subtract<'a, 'b>(a: impl IntoIterator<Item = &'a Self>, b: impl IntoIterator<Item = &'b Self>) -> Result<Vec<Self>, Error> where Self: 'a + 'b;
+	fn boolean_intersect<'a, 'b>(a: impl IntoIterator<Item = &'a Self>, b: impl IntoIterator<Item = &'b Self>) -> Result<Vec<Self>, Error> where Self: 'a + 'b;
+
+	// --- I/O ---
+	// Co-located with constructors: STEP / BRep readers return `Vec<Self>` (a
+	// build path symmetrical with `Solid::cube` etc.), writers/`mesh` consume
+	// solids. Putting them on Solid concentrates the type's surface and keeps
+	// the crate root free of generic names like `mesh` / `write_step`.
+	fn read_step<R: std::io::Read>(reader: &mut R) -> Result<Vec<Self>, Error>;
+	fn read_brep_binary<R: std::io::Read>(reader: &mut R) -> Result<Vec<Self>, Error>;
+	fn read_brep_text<R: std::io::Read>(reader: &mut R) -> Result<Vec<Self>, Error>;
+	fn write_step<'a, W: std::io::Write>(solids: impl IntoIterator<Item = &'a Self>, writer: &mut W) -> Result<(), Error> where Self: 'a;
+	fn write_brep_binary<'a, W: std::io::Write>(solids: impl IntoIterator<Item = &'a Self>, writer: &mut W) -> Result<(), Error> where Self: 'a;
+	fn write_brep_text<'a, W: std::io::Write>(solids: impl IntoIterator<Item = &'a Self>, writer: &mut W) -> Result<(), Error> where Self: 'a;
+	fn mesh<'a>(solids: impl IntoIterator<Item = &'a Self>, tolerance: f64) -> Result<Mesh, Error> where Self: 'a;
 }
 
 // ==================== Compound ====================
@@ -499,12 +635,35 @@ pub trait Compound: Transform {
 
 	fn clean(&self) -> Result<Self, Error>;
 
-	// --- Transform forwarders ---
-	// Let `use cadrum::Compound;` alone pull the Transform surface into scope.
-	// TODO(#90): auto-generate these from `Transform` (extend
-	// build_delegation.rs or introduce a proc-macro) so the list doesn't have
-	// to be mirrored by hand. See the `Transform` doc comment for the design
-	// note. Not urgent.
+
+	// --- Queries ---
+	fn volume(&self) -> f64;
+	fn bounding_box(&self) -> [DVec3; 2];
+	fn contains(&self, point: DVec3) -> bool;
+	/// Total surface area. Aggregates as a simple sum across elements.
+	fn area(&self) -> f64;
+	/// Center of mass (uniform density). Aggregates as a volume-weighted
+	/// average of per-element centers: `Σ(vol_i · center_i) / Σ vol_i`.
+	fn center(&self) -> DVec3;
+	/// Inertia tensor about the **world origin** (uniform density).
+	/// World-origin referencing makes aggregation a straight matrix sum
+	/// (parallel-axis theorem is already folded in). Translate to the
+	/// center-of-mass frame manually if needed.
+	fn inertia(&self) -> DMat3;
+
+	// --- Color ---
+	#[cfg(feature = "color")]
+	fn color(self, color: impl Into<Color>) -> Self;
+	#[cfg(feature = "color")]
+	fn color_clear(self) -> Self;
+
+	// --- Boolean (-> Vec<Self::Elem>) ---
+	// Each result Solid carries its face-derivation history; access via
+	// `Solid::iter_history()`.
+	fn union<'a>(&self, tool: impl IntoIterator<Item = &'a Self::Elem>) -> Result<Vec<Self::Elem>, Error> where Self::Elem: 'a;
+	fn subtract<'a>(&self, tool: impl IntoIterator<Item = &'a Self::Elem>) -> Result<Vec<Self::Elem>, Error> where Self::Elem: 'a;
+	fn intersect<'a>(&self, tool: impl IntoIterator<Item = &'a Self::Elem>) -> Result<Vec<Self::Elem>, Error> where Self::Elem: 'a;
+	////////// codegen.rs
 	fn translate(self, translation: DVec3) -> Self { <Self as Transform>::translate(self, translation) }
 	fn rotate(self, axis_origin: DVec3, axis_direction: DVec3, angle: f64) -> Self { <Self as Transform>::rotate(self, axis_origin, axis_direction, angle) }
 	fn rotate_x(self, angle: f64) -> Self { <Self as Transform>::rotate_x(self, angle) }
@@ -515,26 +674,6 @@ pub trait Compound: Transform {
 	fn align_x(self, new_x: DVec3, y_hint: DVec3) -> Self { <Self as Transform>::align_x(self, new_x, y_hint) }
 	fn align_y(self, new_y: DVec3, z_hint: DVec3) -> Self { <Self as Transform>::align_y(self, new_y, z_hint) }
 	fn align_z(self, new_z: DVec3, x_hint: DVec3) -> Self { <Self as Transform>::align_z(self, new_z, x_hint) }
-
-	// --- Queries ---
-	fn volume(&self) -> f64;
-	fn bounding_box(&self) -> [DVec3; 2];
-	fn contains(&self, point: DVec3) -> bool;
-	fn shell_count(&self) -> u32;
-
-	// --- Color ---
-	#[cfg(feature = "color")]
-	fn color(self, color: impl Into<Color>) -> Self;
-	#[cfg(feature = "color")]
-	fn color_clear(self) -> Self;
-
-	// --- Boolean (-> Vec<Self::Elem>) ---
-	fn union_with_metadata<'a>(&self, tool: impl IntoIterator<Item = &'a Self::Elem>) -> Result<(Vec<Self::Elem>, [Vec<u64>; 2]), Error> where Self::Elem: 'a;
-	fn subtract_with_metadata<'a>(&self, tool: impl IntoIterator<Item = &'a Self::Elem>) -> Result<(Vec<Self::Elem>, [Vec<u64>; 2]), Error> where Self::Elem: 'a;
-	fn intersect_with_metadata<'a>(&self, tool: impl IntoIterator<Item = &'a Self::Elem>) -> Result<(Vec<Self::Elem>, [Vec<u64>; 2]), Error> where Self::Elem: 'a;
-	fn union<'a>(&self, tool: impl IntoIterator<Item = &'a Self::Elem>) -> Result<Vec<Self::Elem>, Error> where Self::Elem: 'a { Ok(self.union_with_metadata(tool)?.0) }
-	fn subtract<'a>(&self, tool: impl IntoIterator<Item = &'a Self::Elem>) -> Result<Vec<Self::Elem>, Error> where Self::Elem: 'a { Ok(self.subtract_with_metadata(tool)?.0) }
-	fn intersect<'a>(&self, tool: impl IntoIterator<Item = &'a Self::Elem>) -> Result<Vec<Self::Elem>, Error> where Self::Elem: 'a { Ok(self.intersect_with_metadata(tool)?.0) }
 }
 
 // `impl Compound for Solid` lives in the backend module (e.g. src/occt/solid.rs)
@@ -559,7 +698,13 @@ impl<T: SolidStruct> Compound for Vec<T> {
 			.unwrap_or([DVec3::ZERO, DVec3::ZERO])
 	}
 	fn contains(&self, p: DVec3) -> bool { self.iter().any(|s| s.contains(p)) }
-	fn shell_count(&self) -> u32 { self.iter().map(|s| s.shell_count()).sum() }
+	fn area(&self) -> f64 { self.iter().map(|s| s.area()).sum() }
+	fn center(&self) -> DVec3 {
+		let total_vol: f64 = self.iter().map(|s| s.volume()).sum();
+		if total_vol == 0.0 { return DVec3::ZERO; }
+		self.iter().map(|s| s.center() * s.volume()).sum::<DVec3>() / total_vol
+	}
+	fn inertia(&self) -> DMat3 { self.iter().map(|s| s.inertia()).fold(DMat3::ZERO, |a, b| a + b) }
 	#[cfg(feature = "color")]
 	fn color(self, color: impl Into<Color>) -> Self {
 		let c: Color = color.into();
@@ -569,13 +714,13 @@ impl<T: SolidStruct> Compound for Vec<T> {
 	fn color_clear(self) -> Self {
 		self.into_iter().map(|s| s.color_clear()).collect()
 	}
-	fn union_with_metadata<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<(Vec<T>, [Vec<u64>; 2]), Error> where T: 'a {
+	fn union<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<Vec<T>, Error> where T: 'a {
 		T::boolean_union(self.iter(), tool)
 	}
-	fn subtract_with_metadata<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<(Vec<T>, [Vec<u64>; 2]), Error> where T: 'a {
+	fn subtract<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<Vec<T>, Error> where T: 'a {
 		T::boolean_subtract(self.iter(), tool)
 	}
-	fn intersect_with_metadata<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<(Vec<T>, [Vec<u64>; 2]), Error> where T: 'a {
+	fn intersect<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<Vec<T>, Error> where T: 'a {
 		T::boolean_intersect(self.iter(), tool)
 	}
 }
@@ -602,7 +747,13 @@ impl<T: SolidStruct, const N: usize> Compound for [T; N] {
 			.unwrap_or([DVec3::ZERO, DVec3::ZERO])
 	}
 	fn contains(&self, p: DVec3) -> bool { self.iter().any(|s| s.contains(p)) }
-	fn shell_count(&self) -> u32 { self.iter().map(|s| s.shell_count()).sum() }
+	fn area(&self) -> f64 { self.iter().map(|s| s.area()).sum() }
+	fn center(&self) -> DVec3 {
+		let total_vol: f64 = self.iter().map(|s| s.volume()).sum();
+		if total_vol == 0.0 { return DVec3::ZERO; }
+		self.iter().map(|s| s.center() * s.volume()).sum::<DVec3>() / total_vol
+	}
+	fn inertia(&self) -> DMat3 { self.iter().map(|s| s.inertia()).fold(DMat3::ZERO, |a, b| a + b) }
 	#[cfg(feature = "color")]
 	fn color(self, color: impl Into<Color>) -> Self {
 		let c: Color = color.into();
@@ -612,13 +763,13 @@ impl<T: SolidStruct, const N: usize> Compound for [T; N] {
 	fn color_clear(self) -> Self {
 		self.map(|s| s.color_clear())
 	}
-	fn union_with_metadata<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<(Vec<T>, [Vec<u64>; 2]), Error> where T: 'a {
+	fn union<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<Vec<T>, Error> where T: 'a {
 		T::boolean_union(self.iter(), tool)
 	}
-	fn subtract_with_metadata<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<(Vec<T>, [Vec<u64>; 2]), Error> where T: 'a {
+	fn subtract<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<Vec<T>, Error> where T: 'a {
 		T::boolean_subtract(self.iter(), tool)
 	}
-	fn intersect_with_metadata<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<(Vec<T>, [Vec<u64>; 2]), Error> where T: 'a {
+	fn intersect<'a>(&self, tool: impl IntoIterator<Item = &'a T>) -> Result<Vec<T>, Error> where T: 'a {
 		T::boolean_intersect(self.iter(), tool)
 	}
 }
@@ -635,25 +786,27 @@ impl<T: EdgeStruct> Wire for Vec<T> {
 		self.first().map(|e| e.start_point()).unwrap_or(DVec3::ZERO)
 	}
 
+	fn end_point(&self) -> DVec3 {
+		self.last().map(|e| e.end_point()).unwrap_or(DVec3::ZERO)
+	}
+
 	fn start_tangent(&self) -> DVec3 {
 		self.first().map(|e| e.start_tangent()).unwrap_or(DVec3::ZERO)
 	}
 
+	fn end_tangent(&self) -> DVec3 {
+		self.last().map(|e| e.end_tangent()).unwrap_or(DVec3::ZERO)
+	}
+
 	fn is_closed(&self) -> bool {
 		// Empty wire: not closed. Single-edge wire: defer to that edge.
-		// Multi-edge wire: walk the polyline approximation of the last edge to
-		// find its end point, and compare with the first edge's start.
+		// Multi-edge wire: the first edge's start equals the last edge's end.
 		// 1e-6 はモデル単位 (mm) を想定したハードコード — 引数化は API が
 		// 増えるため後回し。極小/極大スケールのモデルで誤判定したら直す。
 		match self.len() {
 			0 => false,
 			1 => self[0].is_closed(),
-			_ => {
-				let start = self[0].start_point();
-				let last_pts = self[self.len() - 1].approximation_segments(1e-3);
-				let end = last_pts.last().copied().unwrap_or(DVec3::ZERO);
-				(start - end).length() < 1e-6
-			}
+			_ => (self[0].start_point() - self[self.len() - 1].end_point()).length() < 1e-6,
 		}
 	}
 
@@ -671,6 +824,10 @@ impl<T: EdgeStruct> Wire for Vec<T> {
 			}
 		}
 		out
+	}
+
+	fn project(&self, p: DVec3) -> (DVec3, DVec3) {
+		project_over_edges(self.iter(), p)
 	}
 }
 
@@ -681,20 +838,23 @@ impl<T: EdgeStruct, const N: usize> Wire for [T; N] {
 		self.first().map(|e| e.start_point()).unwrap_or(DVec3::ZERO)
 	}
 
+	fn end_point(&self) -> DVec3 {
+		self.last().map(|e| e.end_point()).unwrap_or(DVec3::ZERO)
+	}
+
 	fn start_tangent(&self) -> DVec3 {
 		self.first().map(|e| e.start_tangent()).unwrap_or(DVec3::ZERO)
+	}
+
+	fn end_tangent(&self) -> DVec3 {
+		self.last().map(|e| e.end_tangent()).unwrap_or(DVec3::ZERO)
 	}
 
 	fn is_closed(&self) -> bool {
 		match N {
 			0 => false,
 			1 => self[0].is_closed(),
-			_ => {
-				let start = self[0].start_point();
-				let last_pts = self[N - 1].approximation_segments(1e-3);
-				let end = last_pts.last().copied().unwrap_or(DVec3::ZERO);
-				(start - end).length() < 1e-6
-			}
+			_ => (self[0].start_point() - self[N - 1].end_point()).length() < 1e-6,
 		}
 	}
 
@@ -713,22 +873,17 @@ impl<T: EdgeStruct, const N: usize> Wire for [T; N] {
 		}
 		out
 	}
+
+	fn project(&self, p: DVec3) -> (DVec3, DVec3) {
+		project_over_edges(self.iter(), p)
+	}
 }
 
-// ==================== I/O ====================
-
-/// Backend-independent I/O trait.
-///
-/// `Solid` is an associated type so this trait does not depend on a concrete
-/// backend type. Each backend's `Io` impl binds `type Solid = ...;`.
-#[allow(non_camel_case_types)]
-pub trait IoModule {
-	type Solid: SolidStruct;
-	fn read_step<R: std::io::Read>(reader: &mut R) -> Result<Vec<Self::Solid>, Error>;
-	fn read_brep_binary<R: std::io::Read>(reader: &mut R) -> Result<Vec<Self::Solid>, Error>;
-	fn read_brep_text<R: std::io::Read>(reader: &mut R) -> Result<Vec<Self::Solid>, Error>;
-	fn write_step<'a, W: std::io::Write>(solids: impl IntoIterator<Item = &'a Self::Solid>, writer: &mut W) -> Result<(), Error> where Self::Solid: 'a;
-	fn write_brep_binary<'a, W: std::io::Write>(solids: impl IntoIterator<Item = &'a Self::Solid>, writer: &mut W) -> Result<(), Error> where Self::Solid: 'a;
-	fn write_brep_text<'a, W: std::io::Write>(solids: impl IntoIterator<Item = &'a Self::Solid>, writer: &mut W) -> Result<(), Error> where Self::Solid: 'a;
-	fn mesh<'a>(solids: impl IntoIterator<Item = &'a Self::Solid>, tolerance: f64) -> Result<Mesh, Error> where Self::Solid: 'a;
+fn project_over_edges<'a, T: 'a + EdgeStruct + Wire>(edges: impl IntoIterator<Item = &'a T>, p: DVec3) -> (DVec3, DVec3) {
+	edges
+		.into_iter()
+		.map(|e| e.project(p))
+		.min_by(|(a, _), (b, _)| (a - p).length_squared().partial_cmp(&(b - p).length_squared()).unwrap_or(std::cmp::Ordering::Equal))
+		.unwrap_or((DVec3::ZERO, DVec3::ZERO))
 }
+

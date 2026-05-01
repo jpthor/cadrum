@@ -1,5 +1,4 @@
 use super::ffi;
-use super::iterators::ApproximationSegmentIterator;
 use crate::common::error::Error;
 use crate::traits::{BSplineEnd, EdgeStruct, Transform, Wire};
 use glam::DVec3;
@@ -27,26 +26,6 @@ impl Edge {
 		}
 	}
 
-	/// Get the approximation segments (polyline points) of this edge as an iterator.
-	///
-	/// `tolerance` controls both the angular deflection (radians) and the
-	/// chord deflection (model units) of the approximation. Smaller values
-	/// produce more points (finer approximation).
-	pub fn approximation_segments_iter(&self, tolerance: f64) -> ApproximationSegmentIterator {
-		let approx = ffi::edge_approximation_segments(&self.inner, tolerance);
-		ApproximationSegmentIterator::new(approx)
-	}
-
-	/// Get the approximation segments with independent angular and chord deflection.
-	///
-	/// - `angular`: maximum angular deflection in radians between consecutive
-	///   tangent directions. Controls how well curves are followed angularly.
-	/// - `chord`: maximum chord deflection in model units (straight-line error
-	///   between the polyline and the true curve). Controls absolute accuracy.
-	pub fn approximation_segments_ex(&self, angular: f64, chord: f64) -> ApproximationSegmentIterator {
-		let approx = ffi::edge_approximation_segments_ex(&self.inner, angular, chord);
-		ApproximationSegmentIterator::new(approx)
-	}
 }
 
 impl Clone for Edge {
@@ -57,6 +36,10 @@ impl Clone for Edge {
 }
 
 impl EdgeStruct for Edge {
+	fn id(&self) -> u64 {
+		ffi::edge_tshape_id(&self.inner)
+	}
+
 	fn helix(radius: f64, pitch: f64, height: f64, axis: DVec3, x_ref: DVec3) -> Result<Self, Error> {
 		let inner = ffi::make_helix_edge(axis.x, axis.y, axis.z, x_ref.x, x_ref.y, x_ref.z, radius, pitch, height);
 		Edge::try_from_ffi(inner, format!("helix: degenerate params (radius={radius}, pitch={pitch}, height={height}, axis={axis:?}, x_ref={x_ref:?})"))
@@ -157,19 +140,31 @@ impl Wire for Edge {
 	type Elem = Edge;
 
 	fn start_point(&self) -> DVec3 {
-		let mut x = 0.0;
-		let mut y = 0.0;
-		let mut z = 0.0;
-		ffi::edge_start_point(&self.inner, &mut x, &mut y, &mut z);
-		DVec3::new(x, y, z)
+		let (mut sx, mut sy, mut sz) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut ex, mut ey, mut ez) = (0.0_f64, 0.0_f64, 0.0_f64);
+		ffi::edge_endpoints(&self.inner, &mut sx, &mut sy, &mut sz, &mut ex, &mut ey, &mut ez);
+		DVec3::new(sx, sy, sz)
+	}
+
+	fn end_point(&self) -> DVec3 {
+		let (mut sx, mut sy, mut sz) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut ex, mut ey, mut ez) = (0.0_f64, 0.0_f64, 0.0_f64);
+		ffi::edge_endpoints(&self.inner, &mut sx, &mut sy, &mut sz, &mut ex, &mut ey, &mut ez);
+		DVec3::new(ex, ey, ez)
 	}
 
 	fn start_tangent(&self) -> DVec3 {
-		let mut x = 0.0;
-		let mut y = 0.0;
-		let mut z = 0.0;
-		ffi::edge_start_tangent(&self.inner, &mut x, &mut y, &mut z);
-		DVec3::new(x, y, z)
+		let (mut sx, mut sy, mut sz) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut ex, mut ey, mut ez) = (0.0_f64, 0.0_f64, 0.0_f64);
+		ffi::edge_tangents(&self.inner, &mut sx, &mut sy, &mut sz, &mut ex, &mut ey, &mut ez);
+		DVec3::new(sx, sy, sz)
+	}
+
+	fn end_tangent(&self) -> DVec3 {
+		let (mut sx, mut sy, mut sz) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut ex, mut ey, mut ez) = (0.0_f64, 0.0_f64, 0.0_f64);
+		ffi::edge_tangents(&self.inner, &mut sx, &mut sy, &mut sz, &mut ex, &mut ey, &mut ez);
+		DVec3::new(ex, ey, ez)
 	}
 
 	fn is_closed(&self) -> bool {
@@ -177,8 +172,24 @@ impl Wire for Edge {
 	}
 
 	fn approximation_segments(&self, tolerance: f64) -> Vec<DVec3> {
-		let approx = ffi::edge_approximation_segments(&self.inner, tolerance);
-		ApproximationSegmentIterator::new(approx).collect()
+		ffi::edge_approximation_segments(&self.inner, tolerance, tolerance)
+			.chunks_exact(3)
+			.map(|c| DVec3::new(c[0], c[1], c[2]))
+			.collect()
+	}
+
+	fn project(&self, p: DVec3) -> (DVec3, DVec3) {
+		let (mut cpx, mut cpy, mut cpz) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut tx, mut ty, mut tz) = (0.0_f64, 0.0_f64, 0.0_f64);
+		// FFI returns false only on truly degenerate edges (no 3D Geom_Curve,
+		// or OCCT internal exception). All cadrum-constructed edges carry a
+		// Geom_Curve, so this is effectively unreachable — treat as a bug and
+		// fail fast rather than returning silent zero.
+		assert!(
+			ffi::edge_project_point(&self.inner, p.x, p.y, p.z, &mut cpx, &mut cpy, &mut cpz, &mut tx, &mut ty, &mut tz),
+			"Edge::project: edge has no 3D curve or OCCT projector threw (this is a bug)"
+		);
+		(DVec3::new(cpx, cpy, cpz), DVec3::new(tx, ty, tz))
 	}
 }
 

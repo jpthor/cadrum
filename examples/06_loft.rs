@@ -4,8 +4,7 @@
 //! - **Morph**: square polygon → circle (cross-section shape transition)
 //! - **Tilted**: three non-parallel circular sections → twisted loft
 
-use cadrum::{Edge, Error, Solid};
-use glam::DVec3;
+use cadrum::{DVec3, Edge, Error, Solid};
 
 /// Two circles → frustum (minimal loft example).
 fn build_frustum() -> Result<Solid, Error> {
@@ -32,7 +31,7 @@ fn build_morph() -> Result<Solid, Error> {
 fn build_tilted() -> Result<Solid, Error> {
 	let bottom = [Edge::circle(2.5, DVec3::Z)?];
 	let mid = [Edge::circle(2.0, DVec3::new(0.3, 0.0, 1.0).normalize())?
-		.translate(DVec3::new(1.0, 0.0, 5.0))];
+		.translate(DVec3::X + DVec3::Z * 5.0)];
 	let top = [Edge::circle(1.5, DVec3::new(-0.2, 0.3, 1.0).normalize())?
 		.translate(DVec3::new(-0.5, 1.0, 10.0))];
 
@@ -43,20 +42,17 @@ fn main() -> Result<(), Error> {
 	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
 
 	let frustum = build_frustum()?;
-	let morph = build_morph()?.translate(DVec3::new(10.0, 0.0, 0.0));
-	let tilted = build_tilted()?.translate(DVec3::new(20.0, 0.0, 0.0));
+	let morph = build_morph()?.translate(DVec3::X * 10.0);
+	let tilted = build_tilted()?.translate(DVec3::X * 20.0);
 
 	let result = [frustum, morph, tilted];
 
-	let step_path = format!("{example_name}.step");
-	let mut f = std::fs::File::create(&step_path).expect("failed to create STEP file");
-	cadrum::write_step(&result, &mut f).expect("failed to write STEP");
-	println!("wrote {step_path}");
+	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
+	Solid::write_step(&result, &mut f).expect("failed to write STEP");
 
-	let svg_path = format!("{example_name}.svg");
-	let mut f = std::fs::File::create(&svg_path).expect("failed to create SVG file");
-	cadrum::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 1.0), true, false, &mut f)).expect("failed to write SVG");
-	println!("wrote {svg_path}");
+	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
+	Solid::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::ONE, DVec3::Z, true, false, &mut f)).expect("failed to write SVG");
 
+	println!("wrote {example_name}.step / {example_name}.svg");
 	Ok(())
 }

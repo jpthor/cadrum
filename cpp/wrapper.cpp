@@ -13,6 +13,7 @@
 #include <TopoDS_Compound.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp.hxx>
+#include <TopExp_Explorer.hxx>
 #include <TopLoc_Location.hxx>
 #include <NCollection_IndexedMap.hxx>
 #include <NCollection_List.hxx>
@@ -22,7 +23,6 @@
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Circ.hxx>
-#include <gp_Lin.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Trsf.hxx>
 #include <Geom_CylindricalSurface.hxx>
@@ -39,9 +39,13 @@
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_MakeSolid.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
+#include <BRepExtrema_ExtPF.hxx>
+#include <BRepLProp_SLProps.hxx>
+#include <BRepAdaptor_Surface.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
@@ -59,13 +63,18 @@
 #include <BRepTools_History.hxx>
 
 // --- Sweep / pipe / loft ---
+#include <BRepFilletAPI_MakeFillet.hxx>
+#include <BRepFilletAPI_MakeChamfer.hxx>
+#include <BRepOffsetAPI_MakeOffsetShape.hxx>
 #include <BRepOffsetAPI_MakePipeShell.hxx>
+#include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
+#include <BRepOffset_Mode.hxx>
+#include <GeomAbs_JoinType.hxx>
 
 // --- Mesh, classification, mass / surface properties ---
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <Poly_Triangulation.hxx>
-#include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
 #include <BRepGProp.hxx>
@@ -76,6 +85,7 @@
 #include <GCPnts_TangentialDeflection.hxx>
 #include <GeomAPI_Interpolate.hxx>
 #include <GeomAPI_PointsToBSplineSurface.hxx>
+#include <GeomAPI_ProjectPointOnCurve.hxx>
 #include <Geom_BSplineCurve.hxx>
 #include <Geom_BSplineSurface.hxx>
 #include <NCollection_Array2.hxx>
@@ -83,11 +93,17 @@
 #include <Precision.hxx>
 
 // --- I/O (BREP / STEP / progress) ---
+// STEP-specific headers are only needed by the non-color STEP path
+// (`read_step_stream` / `write_step_stream`); with color, STEP routes
+// through XCAF in the CADRUM_COLOR section below.
 #include <BRepTools.hxx>
 #include <BinTools.hxx>
+#ifndef CADRUM_COLOR
 #include <STEPControl_Reader.hxx>
 #include <STEPControl_Writer.hxx>
 #include <Message_ProgressRange.hxx>
+#endif
+#include <Message.hxx>
 
 // --- C++ standard library ---
 #include <istream>
@@ -102,6 +118,21 @@
 #include <array>
 
 namespace cadrum {
+
+// Forward declaration: STEP read post-process (defined further below near
+// decompose_into_solids). Used by both read_step_stream (this section) and
+// read_step_color_stream (in the CADRUM_COLOR block).
+static TopoDS_Shape try_sew_orphan_faces(
+    const TopoDS_Shape& compound,
+    std::unordered_map<uint64_t, std::array<float, 3>>* colorMap);
+
+// OCCT defaults to a stdout printer that emits "Statistics on Transfer" banners on STEP read/write.
+// Clear all printers at load time per the documented recommendation.
+// ******        Statistics on Transfer (Write)                 ******
+static const int _silence_occt_default_printer = []() {
+    Message::DefaultMessenger()->ChangePrinters().Clear();
+    return 0;
+}();
 
 // ==================== RustReadStreambuf ====================
 
@@ -187,8 +218,9 @@ std::unique_ptr<TopoDS_Shape> read_step_stream(RustReader& reader) {
     }
 
     step_reader->TransferRoots(Message_ProgressRange());
-    return std::make_unique<TopoDS_Shape>(step_reader->OneShape());
     // step_reader is intentionally leaked — see comment above.
+    return std::make_unique<TopoDS_Shape>(
+        try_sew_orphan_faces(step_reader->OneShape(), nullptr));
 }
 
 bool write_step_stream(const TopoDS_Shape& shape, RustWriter& writer) {
@@ -371,8 +403,86 @@ std::unique_ptr<TopoDS_Shape> deep_copy(const TopoDS_Shape& shape) {
     return std::make_unique<TopoDS_Shape>(copier.Shape());
 }
 
-std::unique_ptr<TopoDS_Shape> shallow_copy(const TopoDS_Shape& shape) {
-    return std::make_unique<TopoDS_Shape>(shape);
+// ==================== STEP read post-processing ====================
+
+// Recover Solids from a STEP-read Compound that has disjoint shells / loose
+// faces (multi-color export from SolveSpace etc.). Returns the original
+// compound if no orphan faces are found (= valid STEP, zero overhead).
+//
+// If `colorMap` is non-null, remaps its keys for faces whose TShape* changed
+// during sewing (only applicable when called from the color path).
+//
+// See #129 for the reproducer and root-cause analysis.
+//
+// Design notes:
+//   - has_orphans を残す理由: SewedShape().IsNull() でも判定可能だが、
+//     (a) 空入力 Perform() を回避、(b) 「sewing 不要」と「sewing 失敗」を区別、
+//     の 2 点で明示フラグ優位。
+//   - Solid 配下の face を sewer に入れない理由: 既存 valid Solid の face は
+//     TShape* preserve したい (colormap キー保持 + 既存挙動互換)。
+//   - TopoDS_Iterator (immediate children) ではなく TopExp_Explorer (再帰) を
+//     使う理由: STEP のツリー構造で valid Solid が深い所に埋まり、その兄弟に
+//     orphan face がある混在ケース (例: Compound { sub { Solid + face×6 } })
+//     を救うため。
+//   - tolerance = Precision::Confusion(): 重複 EDGE_CURVE は座標完全一致なので
+//     最厳設定で十分。緩めると意図しない縫合リスクが増す。
+static TopoDS_Shape try_sew_orphan_faces(
+    const TopoDS_Shape& compound,
+    std::unordered_map<uint64_t, std::array<float, 3>>* colorMap)
+{
+    // 1. 既存 Solid と配下 face TShape* 集合を回収
+    std::unordered_set<const TopoDS_TShape*> in_solid;
+    std::vector<TopoDS_Shape> existing_solids;
+    for (TopExp_Explorer sx(compound, TopAbs_SOLID); sx.More(); sx.Next()) {
+        existing_solids.push_back(sx.Current());
+        for (TopExp_Explorer fx(sx.Current(), TopAbs_FACE); fx.More(); fx.Next()) {
+            in_solid.insert(fx.Current().TShape().get());
+        }
+    }
+
+    // 2. 孤立 face を Sewing に投入
+    BRepBuilderAPI_Sewing sewer(Precision::Confusion());
+    bool has_orphans = false;
+    std::vector<TopoDS_Shape> orphan_faces;  // color remap 用に保持
+    for (TopExp_Explorer fx(compound, TopAbs_FACE); fx.More(); fx.Next()) {
+        if (in_solid.count(fx.Current().TShape().get()) == 0) {
+            sewer.Add(fx.Current());
+            orphan_faces.push_back(fx.Current());
+            has_orphans = true;
+        }
+    }
+
+    // 3. 正常 STEP は素通し (= zero-overhead)
+    if (!has_orphans) return compound;
+
+    // 4. 縫合 → Shell ごとに MakeSolid → 新 compound 構築
+    sewer.Perform();
+    TopoDS_Shape sewn = sewer.SewedShape();
+
+    BRep_Builder bb;
+    TopoDS_Compound new_compound;
+    bb.MakeCompound(new_compound);
+    for (const auto& s : existing_solids) bb.Add(new_compound, s);
+    for (TopExp_Explorer sx(sewn, TopAbs_SHELL); sx.More(); sx.Next()) {
+        BRepBuilderAPI_MakeSolid mk(TopoDS::Shell(sx.Current()));
+        if (mk.IsDone()) bb.Add(new_compound, mk.Solid());
+    }
+
+    // 5. colormap キー remap (color path のみ)
+    if (colorMap) {
+        for (const auto& old_face : orphan_faces) {
+            uint64_t old_id = reinterpret_cast<uint64_t>(old_face.TShape().get());
+            auto it = colorMap->find(old_id);
+            if (it == colorMap->end()) continue;
+            if (sewer.IsModified(old_face)) {
+                uint64_t new_id = reinterpret_cast<uint64_t>(
+                    sewer.Modified(old_face).TShape().get());
+                (*colorMap)[new_id] = it->second;
+            }
+        }
+    }
+
+    return new_compound;
 }
 
 // ==================== Compound Decompose/Compose ====================
@@ -390,7 +500,7 @@ void compound_add(TopoDS_Shape& compound, const TopoDS_Shape& child) {
     builder.Add(compound, child);
 }
 
-// ==================== Boolean Operations ====================
+// ==================== Builders (solid → solid with history) ====================
 // Bug 1 fix: All boolean results are deep-copied via BRepBuilderAPI_Copy
 // so the result shares no Handle<Geom_XXX> with the input shapes.
 // This prevents STATUS_HEAP_CORRUPTION when shapes are dropped in any order.
@@ -405,11 +515,14 @@ void compound_add(TopoDS_Shape& compound, const TopoDS_Shape& child) {
 //   the face still represents the same plane — it just has smaller bounds.
 //   Generated(tool_face) returns empty because no wholly NEW face was created.
 //
-// from_a / from_b (修正案2):
-//   For each face in src, collect_relay_mapping builds a map from the
-//   pre-copy TShape* of the result face to the TShape* of the original src face.
-//   After BRepBuilderAPI_Copy, copier.ModifiedShape() maps pre→post copy.
-//   The combined mapping (src → pre → post) is stored as flat [post_id, src_id] pairs.
+// out_history (rust::Vec<uint64_t>):
+//   For each face in src (both a and b), collect_relay_mapping builds a map
+//   from the pre-copy TShape* of the result face to the TShape* of the
+//   original src face. After BRepBuilderAPI_Copy, the pre→post mapping is
+//   resolved by index in the IndexedMap. emit_from_pairs pushes flat
+//   [post_id, src_id] pairs into out_history. a and b contributions are
+//   concatenated into the same out_history (no self/tool split — TShape*
+//   pointers are globally unique).
 
 // Helper: build relay map  pre_copy_result_tshape* → src_tshape*
 // Called before BRepBuilderAPI_Copy, while op history is alive.
@@ -442,13 +555,13 @@ static void emit_from_pairs(
     const TopoDS_Shape& pre_shape,
     const TopoDS_Shape& post_shape,
     const std::unordered_map<uint64_t, uint64_t>& relay,
-    std::vector<uint64_t>& out)
+    rust::Vec<uint64_t>& out)
 {
     NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> pre_map, post_map;
     TopExp::MapShapes(pre_shape, TopAbs_FACE, pre_map);
     TopExp::MapShapes(post_shape, TopAbs_FACE, post_map);
     // pre_map and post_map have the same size because the copy preserves topology.
-    for (int i = 1; i <= pre_map.Size(); ++i) {
+    for (int i = 1; i <= pre_map.Extent(); ++i) {
         uint64_t pre_id = reinterpret_cast<uint64_t>(pre_map(i).TShape().get());
         auto it = relay.find(pre_id);
         if (it == relay.end()) continue;
@@ -467,8 +580,12 @@ static void emit_from_pairs(
 // All three OCCT operations derive from BRepAlgoAPI_BooleanOperation, so the
 // post-build relay/copy logic is identical. Branching only at construction
 // avoids triplicating the bookkeeping.
-std::unique_ptr<BooleanShape> boolean_op(
-    const TopoDS_Shape& a, const TopoDS_Shape& b, uint32_t op_kind)
+//
+// out_history is appended-to (not cleared) — caller passes an empty rust::Vec.
+// Both a and b contributions are pushed into the same flat sequence.
+std::unique_ptr<TopoDS_Shape> builder_boolean(
+    const TopoDS_Shape& a, const TopoDS_Shape& b, uint32_t op_kind,
+    rust::Vec<uint64_t>& out_history)
 {
     try {
         std::unique_ptr<BRepAlgoAPI_BooleanOperation> op;
@@ -486,51 +603,58 @@ std::unique_ptr<BooleanShape> boolean_op(
         collect_relay_mapping(*op, b, relay_b);
 
         BRepBuilderAPI_Copy copier(op->Shape(), true, false);
-        auto r = std::make_unique<BooleanShape>();
-        r->shape = copier.Shape();
-        emit_from_pairs(op->Shape(), copier.Shape(), relay_a, r->from_a);
-        emit_from_pairs(op->Shape(), copier.Shape(), relay_b, r->from_b);
-        return r;
+        auto shape = std::make_unique<TopoDS_Shape>(copier.Shape());
+        emit_from_pairs(op->Shape(), copier.Shape(), relay_a, out_history);
+        emit_from_pairs(op->Shape(), copier.Shape(), relay_b, out_history);
+        return shape;
     } catch (const Standard_Failure&) {
         return nullptr;
     }
 }
 
-std::unique_ptr<TopoDS_Shape> boolean_shape_shape(const BooleanShape& r) {
-    return std::make_unique<TopoDS_Shape>(r.shape);
-}
-
-rust::Vec<uint64_t> boolean_shape_from_a(const BooleanShape& r) {
-    rust::Vec<uint64_t> v;
-    for (uint64_t x : r.from_a) v.push_back(x);
-    return v;
-}
-
-rust::Vec<uint64_t> boolean_shape_from_b(const BooleanShape& r) {
-    rust::Vec<uint64_t> v;
-    for (uint64_t x : r.from_b) v.push_back(x);
-    return v;
-}
-
-// ==================== Shape Methods ====================
-
-#ifndef CADRUM_COLOR
-// Plain clean — used only when CADRUM_COLOR is not defined.
-// With color, clean goes through `clean_shape_full` which also returns a
-// face-id remapping table so the colormap can follow merged faces.
-std::unique_ptr<TopoDS_Shape> clean_shape(const TopoDS_Shape& shape) {
+// Unify shared faces / collinear edges. `out_history` is populated with
+// flat [new_id, old_id, ...] pairs covering every old face that survived
+// (either unchanged, or merged into a result face); identical layout to
+// `builder_boolean`'s history.
+std::unique_ptr<TopoDS_Shape> builder_clean(
+    const TopoDS_Shape& shape,
+    rust::Vec<uint64_t>& out_history)
+{
     try {
         ShapeUpgrade_UnifySameDomain unifier(shape, true, true, true);
         unifier.AllowInternalEdges(false);
         unifier.Build();
-        return std::make_unique<TopoDS_Shape>(unifier.Shape());
+
+        auto result = std::make_unique<TopoDS_Shape>(unifier.Shape());
+
+        Handle(BRepTools_History) history = unifier.History();
+        if (!history.IsNull()) {
+            for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+                const TopoDS_Shape& old_face = ex.Current();
+                uint64_t old_id = reinterpret_cast<uint64_t>(old_face.TShape().get());
+                if (history->IsRemoved(old_face)) continue;
+                const NCollection_List<TopoDS_Shape>& mods = history->Modified(old_face);
+                if (mods.IsEmpty()) {
+                    // Unchanged: TShape* is the same in the result.
+                    out_history.push_back(old_id);
+                    out_history.push_back(old_id);
+                } else {
+                    // Merged: use only the first resulting face (first-found wins).
+                    uint64_t new_id = reinterpret_cast<uint64_t>(mods.First().TShape().get());
+                    out_history.push_back(new_id);
+                    out_history.push_back(old_id);
+                }
+            }
+        }
+        return result;
     } catch (const Standard_Failure&) {
         return nullptr;
     }
 }
-#endif // !CADRUM_COLOR
 
-std::unique_ptr<TopoDS_Shape> translate_shape(
+// ==================== Transforms (solid → solid, no history) ====================
+
+std::unique_ptr<TopoDS_Shape> transform_translate(
     const TopoDS_Shape& shape,
     double tx, double ty, double tz)
 {
@@ -539,7 +663,7 @@ std::unique_ptr<TopoDS_Shape> translate_shape(
     return std::make_unique<TopoDS_Shape>(shape.Moved(TopLoc_Location(trsf)));
 }
 
-std::unique_ptr<TopoDS_Shape> rotate_shape(
+std::unique_ptr<TopoDS_Shape> transform_rotate(
     const TopoDS_Shape& shape,
     double ox, double oy, double oz,
     double dx, double dy, double dz,
@@ -554,7 +678,7 @@ std::unique_ptr<TopoDS_Shape> rotate_shape(
     }
 }
 
-std::unique_ptr<TopoDS_Shape> scale_shape(
+std::unique_ptr<TopoDS_Shape> transform_scale(
     const TopoDS_Shape& shape,
     double cx, double cy, double cz,
     double factor)
@@ -569,7 +693,7 @@ std::unique_ptr<TopoDS_Shape> scale_shape(
     }
 }
 
-std::unique_ptr<TopoDS_Shape> mirror_shape(
+std::unique_ptr<TopoDS_Shape> transform_mirror(
     const TopoDS_Shape& shape,
     double ox, double oy, double oz,
     double nx, double ny, double nz)
@@ -584,6 +708,8 @@ std::unique_ptr<TopoDS_Shape> mirror_shape(
     }
 }
 
+// ==================== Shape Queries ====================
+
 bool shape_is_null(const TopoDS_Shape& shape) {
     return shape.IsNull();
 }
@@ -592,18 +718,51 @@ bool shape_is_solid(const TopoDS_Shape& shape) {
     return !shape.IsNull() && shape.ShapeType() == TopAbs_SOLID;
 }
 
-uint32_t shape_shell_count(const TopoDS_Shape& shape) {
-    uint32_t count = 0;
-    for (TopExp_Explorer ex(shape, TopAbs_SHELL); ex.More(); ex.Next()) {
-        ++count;
-    }
-    return count;
-}
-
 double shape_volume(const TopoDS_Shape& shape) {
     GProp_GProps props;
     BRepGProp::VolumeProperties(shape, props);
     return props.Mass();
+}
+
+double shape_surface_area(const TopoDS_Shape& shape) {
+    GProp_GProps props;
+    BRepGProp::SurfaceProperties(shape, props);
+    return props.Mass();
+}
+
+void shape_center_of_mass(const TopoDS_Shape& shape,
+    double& x, double& y, double& z)
+{
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(shape, props);
+    gp_Pnt com = props.CentreOfMass();
+    x = com.X(); y = com.Y(); z = com.Z();
+}
+
+void shape_inertia_tensor(const TopoDS_Shape& shape,
+    double& m00, double& m01, double& m02,
+    double& m10, double& m11, double& m12,
+    double& m20, double& m21, double& m22)
+{
+    // OCCT's MatrixOfInertia() is expressed about the center of mass, but the
+    // Rust-side API returns the tensor about the world origin so collections
+    // can aggregate by plain matrix sum (parallel-axis theorem is already
+    // folded in). Shift here with I_world = I_com + m·(|d|² I - d⊗d),
+    // where d = COM vector from world origin, m = volume (uniform density).
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(shape, props);
+    gp_Mat ic = props.MatrixOfInertia();
+    gp_Pnt com = props.CentreOfMass();
+    double mass = props.Mass();
+    double dx = com.X(), dy = com.Y(), dz = com.Z();
+    double d2 = dx*dx + dy*dy + dz*dz;
+    m00 = ic.Value(1,1) + mass * (d2 - dx*dx);
+    m11 = ic.Value(2,2) + mass * (d2 - dy*dy);
+    m22 = ic.Value(3,3) + mass * (d2 - dz*dz);
+    m01 = ic.Value(1,2) - mass * dx * dy;
+    m02 = ic.Value(1,3) - mass * dx * dz;
+    m12 = ic.Value(2,3) - mass * dy * dz;
+    m10 = m01; m20 = m02; m21 = m12;
 }
 
 bool shape_contains_point(const TopoDS_Shape& shape, double x, double y, double z) {
@@ -731,40 +890,53 @@ MeshData mesh_shape(const TopoDS_Shape& shape, double tolerance) {
     return result;
 }
 
-// ==================== Explorer / Iterators ====================
+// ==================== Topology enumeration ====================
 
-std::unique_ptr<TopExp_Explorer> explore_faces(const TopoDS_Shape& shape) {
-    return std::make_unique<TopExp_Explorer>(shape, TopAbs_FACE);
-}
-
-std::unique_ptr<TopExp_Explorer> explore_edges(const TopoDS_Shape& shape) {
+std::unique_ptr<std::vector<TopoDS_Edge>> shape_edges(const TopoDS_Shape& shape) {
     // TopExp_Explorer visits shared edges once per adjacent face.
-    // Build a flat compound of unique edges so each is visited exactly once.
+    // NCollection_IndexedMap collapses those into unique edges.
     NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> edgeMap;
     TopExp::MapShapes(shape, TopAbs_EDGE, edgeMap);
-    TopoDS_Compound compound;
-    BRep_Builder builder;
-    builder.MakeCompound(compound);
+    auto out = std::make_unique<std::vector<TopoDS_Edge>>();
+    out->reserve(edgeMap.Extent());
     for (int i = 1; i <= edgeMap.Extent(); i++) {
-        builder.Add(compound, edgeMap(i));
+        out->push_back(TopoDS::Edge(edgeMap(i)));
     }
-    return std::make_unique<TopExp_Explorer>(compound, TopAbs_EDGE);
+    return out;
 }
 
-bool explorer_more(const TopExp_Explorer& explorer) {
-    return explorer.More();
+std::unique_ptr<std::vector<TopoDS_Face>> shape_faces(const TopoDS_Shape& shape) {
+    // Faces in a valid shape are already unique under TopExp_Explorer.
+    auto out = std::make_unique<std::vector<TopoDS_Face>>();
+    for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+        out->push_back(TopoDS::Face(ex.Current()));
+    }
+    return out;
 }
 
-void explorer_next(TopExp_Explorer& explorer) {
-    explorer.Next();
+std::unique_ptr<std::vector<TopoDS_Edge>> face_edges(const TopoDS_Face& face) {
+    // A face's outer wire and (optional) inner wires can share edges; collapse
+    // them into unique edges with the same IndexedMap trick used in shape_edges.
+    NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> edgeMap;
+    TopExp::MapShapes(face, TopAbs_EDGE, edgeMap);
+    auto out = std::make_unique<std::vector<TopoDS_Edge>>();
+    out->reserve(edgeMap.Extent());
+    for (int i = 1; i <= edgeMap.Extent(); i++) {
+        out->push_back(TopoDS::Edge(edgeMap(i)));
+    }
+    return out;
 }
 
-std::unique_ptr<TopoDS_Face> explorer_current_face(const TopExp_Explorer& explorer) {
-    return std::make_unique<TopoDS_Face>(TopoDS::Face(explorer.Current()));
+std::unique_ptr<TopoDS_Shape> clone_shape_handle(const TopoDS_Shape& shape) {
+    return std::make_unique<TopoDS_Shape>(shape);
 }
 
-std::unique_ptr<TopoDS_Edge> explorer_current_edge(const TopExp_Explorer& explorer) {
-    return std::make_unique<TopoDS_Edge>(TopoDS::Edge(explorer.Current()));
+std::unique_ptr<TopoDS_Edge> clone_edge_handle(const TopoDS_Edge& edge) {
+    return std::make_unique<TopoDS_Edge>(edge);
+}
+
+std::unique_ptr<TopoDS_Face> clone_face_handle(const TopoDS_Face& face) {
+    return std::make_unique<TopoDS_Face>(face);
 }
 
 // ==================== Face Methods ====================
@@ -777,41 +949,86 @@ uint64_t shape_tshape_id(const TopoDS_Shape& shape) {
     return reinterpret_cast<uint64_t>(shape.TShape().get());
 }
 
+uint64_t edge_tshape_id(const TopoDS_Edge& edge) {
+    return reinterpret_cast<uint64_t>(edge.TShape().get());
+}
+
+bool face_project_point(const TopoDS_Face& face,
+    double px, double py, double pz,
+    double& cpx, double& cpy, double& cpz,
+    double& nx, double& ny, double& nz)
+{
+    // Default normal = zero. Returned when BRepLProp can't define a normal
+    // at the closest hit (e.g. degenerate surface point or zero first
+    // derivative). Caller can detect via `normal.length() == 0`.
+    nx = 0.0; ny = 0.0; nz = 0.0;
+
+    try {
+        // BRepExtrema_ExtPF respects face trim, unlike Extrema_ExtPS which
+        // works on the underlying infinite surface. The vertex wrapping
+        // overhead (Handle alloc) is bounded — single Handle per call.
+        TopoDS_Vertex vert = BRepBuilderAPI_MakeVertex(gp_Pnt(px, py, pz));
+        BRepExtrema_ExtPF ext(vert, face);
+        if (!ext.IsDone() || ext.NbExt() < 1) return false;
+
+        // Pick the smallest-distance extremum.
+        int best = 1;
+        double best_d2 = ext.SquareDistance(1);
+        for (int i = 2; i <= ext.NbExt(); ++i) {
+            double d2 = ext.SquareDistance(i);
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best = i;
+            }
+        }
+
+        gp_Pnt cp = ext.Point(best);
+        cpx = cp.X();
+        cpy = cp.Y();
+        cpz = cp.Z();
+
+        double u, v;
+        ext.Parameter(best, u, v);
+
+        BRepAdaptor_Surface surf(face);
+        BRepLProp_SLProps props(surf, u, v, /*derivOrder=*/1, Precision::Confusion());
+        if (!props.IsNormalDefined()) return true;  // cp valid, normal stays 0.
+
+        gp_Dir n = props.Normal();
+        // BRepLProp returns the surface-orientation normal; flip when the
+        // face is REVERSED in its enclosing shell so the caller always
+        // sees an outward-pointing direction.
+        if (face.Orientation() == TopAbs_REVERSED) n.Reverse();
+        nx = n.X();
+        ny = n.Y();
+        nz = n.Z();
+        return true;
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+}
+
 // ==================== Edge Methods ====================
 
-ApproxPoints edge_approximation_segments_ex(
+rust::Vec<double> edge_approximation_segments(
     const TopoDS_Edge& edge, double angular, double chord)
 {
-    ApproxPoints result;
-    result.count = 0;
-
+    rust::Vec<double> out;
     try {
         BRepAdaptor_Curve curve(edge);
         GCPnts_TangentialDeflection approx(curve, angular, chord);
 
         int nb_points = approx.NbPoints();
-        result.count = static_cast<uint32_t>(nb_points);
-
         for (int i = 1; i <= nb_points; i++) {
             gp_Pnt p = approx.Value(i);
-            result.coords.push_back(p.X());
-            result.coords.push_back(p.Y());
-            result.coords.push_back(p.Z());
+            out.push_back(p.X());
+            out.push_back(p.Y());
+            out.push_back(p.Z());
         }
     } catch (const Standard_Failure&) {
-        result.count = 0;
-        result.coords.clear();
+        out.clear();
     }
-
-    return result;
-}
-
-ApproxPoints edge_approximation_segments(
-    const TopoDS_Edge& edge, double tolerance)
-{
-    // Bug 4 fix: tolerance is now a parameter instead of hardcoded 0.1.
-    // Delegate to the ex variant with angular == chord == tolerance.
-    return edge_approximation_segments_ex(edge, tolerance, tolerance);
+    return out;
 }
 
 std::unique_ptr<TopoDS_Edge> make_helix_edge(
@@ -1000,25 +1217,40 @@ std::unique_ptr<TopoDS_Edge> make_bspline_edge(
     }
 }
 
-void edge_start_point(const TopoDS_Edge& edge, double& x, double& y, double& z) {
-    x = 0.0; y = 0.0; z = 0.0;
+void edge_endpoints(const TopoDS_Edge& edge,
+    double& sx, double& sy, double& sz,
+    double& ex, double& ey, double& ez)
+{
+    sx = 0.0; sy = 0.0; sz = 0.0;
+    ex = 0.0; ey = 0.0; ez = 0.0;
     try {
         BRepAdaptor_Curve curve(edge);
-        gp_Pnt p = curve.Value(curve.FirstParameter());
-        x = p.X(); y = p.Y(); z = p.Z();
+        gp_Pnt start = curve.Value(curve.FirstParameter());
+        gp_Pnt end = curve.Value(curve.LastParameter());
+        sx = start.X(); sy = start.Y(); sz = start.Z();
+        ex = end.X();   ey = end.Y();   ez = end.Z();
     } catch (const Standard_Failure&) {}
 }
 
-void edge_start_tangent(const TopoDS_Edge& edge, double& x, double& y, double& z) {
-    x = 0.0; y = 0.0; z = 0.0;
+void edge_tangents(const TopoDS_Edge& edge,
+    double& sx, double& sy, double& sz,
+    double& ex, double& ey, double& ez)
+{
+    sx = 0.0; sy = 0.0; sz = 0.0;
+    ex = 0.0; ey = 0.0; ez = 0.0;
     try {
         BRepAdaptor_Curve curve(edge);
         gp_Pnt p;
-        gp_Vec v;
-        curve.D1(curve.FirstParameter(), p, v);
-        if (v.Magnitude() > Precision::Confusion()) {
-            v.Normalize();
-            x = v.X(); y = v.Y(); z = v.Z();
+        gp_Vec vs, ve;
+        curve.D1(curve.FirstParameter(), p, vs);
+        curve.D1(curve.LastParameter(), p, ve);
+        if (vs.Magnitude() > Precision::Confusion()) {
+            vs.Normalize();
+            sx = vs.X(); sy = vs.Y(); sz = vs.Z();
+        }
+        if (ve.Magnitude() > Precision::Confusion()) {
+            ve.Normalize();
+            ex = ve.X(); ey = ve.Y(); ez = ve.Z();
         }
     } catch (const Standard_Failure&) {}
 }
@@ -1029,6 +1261,44 @@ bool edge_is_closed(const TopoDS_Edge& edge) {
         gp_Pnt p_start = curve.Value(curve.FirstParameter());
         gp_Pnt p_end   = curve.Value(curve.LastParameter());
         return p_start.Distance(p_end) < Precision::Confusion();
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+}
+
+bool edge_project_point(const TopoDS_Edge& edge,
+    double px, double py, double pz,
+    double& cpx, double& cpy, double& cpz,
+    double& tx, double& ty, double& tz)
+{
+    cpx = 0.0; cpy = 0.0; cpz = 0.0;
+    tx = 0.0; ty = 0.0; tz = 0.0;
+    try {
+        double first = 0.0, last = 0.0;
+        Handle(Geom_Curve) gcurve = BRep_Tool::Curve(edge, first, last);
+        if (gcurve.IsNull()) return false;
+        gp_Pnt target(px, py, pz);
+        GeomAPI_ProjectPointOnCurve projector(target, gcurve, first, last);
+        double u;
+        if (projector.NbPoints() > 0) {
+            u = projector.LowerDistanceParameter();
+        } else {
+            // No interior extremum within [first, last] — distance is monotonic
+            // along the curve segment (e.g. line segment with target beyond an
+            // endpoint). Clamp to whichever endpoint is closer.
+            double d_first = target.Distance(gcurve->Value(first));
+            double d_last  = target.Distance(gcurve->Value(last));
+            u = (d_first <= d_last) ? first : last;
+        }
+        gp_Pnt p;
+        gp_Vec v;
+        gcurve->D1(u, p, v);
+        cpx = p.X(); cpy = p.Y(); cpz = p.Z();
+        if (v.Magnitude() > Precision::Confusion()) {
+            v.Normalize();
+            tx = v.X(); ty = v.Y(); tz = v.Z();
+        }
+        return true;
     } catch (const Standard_Failure&) {
         return false;
     }
@@ -1113,6 +1383,143 @@ void edge_vec_push(std::vector<TopoDS_Edge>& v, const TopoDS_Edge& e) {
 
 void edge_vec_push_null(std::vector<TopoDS_Edge>& v) {
     v.push_back(TopoDS_Edge());
+}
+
+std::unique_ptr<std::vector<TopoDS_Face>> face_vec_new() {
+    return std::make_unique<std::vector<TopoDS_Face>>();
+}
+
+void face_vec_push(std::vector<TopoDS_Face>& v, const TopoDS_Face& f) {
+    v.push_back(f);
+}
+
+std::unique_ptr<TopoDS_Shape> builder_thick_solid(
+    const TopoDS_Shape& solid,
+    const std::vector<TopoDS_Face>& open_faces,
+    double thickness)
+{
+    try {
+        // Empty open_faces: MakeThickSolidByJoin degenerates to a plain offset
+        // shape (no cavity) because it needs at least one removed face to
+        // build the first wall W1. Instead, build the solid explicitly as
+        // outer_shell + reversed inner_shell so the result is a sealed solid
+        // with an internal void (OCCT permits multi-shell solids).
+        if (open_faces.empty()) {
+            BRepOffsetAPI_MakeOffsetShape offset;
+            offset.PerformByJoin(
+                solid, thickness,
+                /*tolerance=*/ 1.0e-6,
+                /*mode=*/ BRepOffset_Skin,
+                /*intersection=*/ false,
+                /*selfInter=*/ false,
+                /*join=*/ GeomAbs_Arc);
+            if (!offset.IsDone()) return nullptr;
+            TopoDS_Shape offset_shape = offset.Shape();
+
+            auto extract_shell = [](const TopoDS_Shape& s) -> TopoDS_Shell {
+                if (s.ShapeType() == TopAbs_SHELL) return TopoDS::Shell(s);
+                TopExp_Explorer ex(s, TopAbs_SHELL);
+                if (!ex.More()) return TopoDS_Shell();
+                return TopoDS::Shell(ex.Current());
+            };
+
+            TopoDS_Shell original_shell = extract_shell(solid);
+            TopoDS_Shell offset_shell = extract_shell(offset_shape);
+            if (original_shell.IsNull() || offset_shell.IsNull()) return nullptr;
+
+            // thickness sign determines which shell is outer:
+            //   negative → offset shrinks inward: original = outer, offset = inner cavity
+            //   positive → offset expands outward: offset = outer, original = inner cavity
+            TopoDS_Shell outer = thickness < 0.0 ? original_shell : offset_shell;
+            TopoDS_Shell inner = thickness < 0.0 ? offset_shell : original_shell;
+
+            BRepBuilderAPI_MakeSolid solid_maker(outer);
+            solid_maker.Add(TopoDS::Shell(inner.Reversed()));
+            if (!solid_maker.IsDone()) return nullptr;
+            return std::make_unique<TopoDS_Shape>(solid_maker.Solid());
+        }
+
+        NCollection_List<TopoDS_Shape> faces_to_remove;
+        for (const auto& f : open_faces) faces_to_remove.Append(f);
+
+        BRepOffsetAPI_MakeThickSolid builder;
+        builder.MakeThickSolidByJoin(
+            solid, faces_to_remove, thickness,
+            /*tolerance=*/ 1.0e-6,
+            /*mode=*/ BRepOffset_Skin,
+            /*intersection=*/ false,
+            /*selfInter=*/ false,
+            /*join=*/ GeomAbs_Arc);
+        builder.Build();
+        if (!builder.IsDone()) return nullptr;
+        return std::make_unique<TopoDS_Shape>(builder.Shape());
+    } catch (const Standard_Failure&) {
+        return nullptr;
+    }
+}
+
+std::unique_ptr<TopoDS_Shape> builder_fillet(
+    const TopoDS_Shape& solid,
+    const std::vector<TopoDS_Edge>& edges,
+    double radius)
+{
+    try {
+        if (edges.empty()) {
+            // No-op: hand back an independent shallow copy so the Rust side
+            // always gets a fresh owned handle (matches the non-empty path).
+            return std::make_unique<TopoDS_Shape>(solid);
+        }
+        BRepFilletAPI_MakeFillet mk(solid);
+        for (const TopoDS_Edge& e : edges) {
+            if (e.IsNull()) continue;
+            mk.Add(radius, e);
+        }
+        mk.Build();
+        if (!mk.IsDone()) return nullptr;
+        TopoDS_Shape result = mk.Shape();
+        if (result.IsNull()) return nullptr;
+        // MakeFillet can wrap the solid in a compound even if it contains only one solid.
+        // Solid::new requires a TopAbs_SOLID, so extract the first one if we got a container.
+        if (result.ShapeType() != TopAbs_SOLID) {
+            TopExp_Explorer ex(result, TopAbs_SOLID);
+            if (!ex.More()) return nullptr;
+            result = ex.Current();
+        }
+        return std::make_unique<TopoDS_Shape>(result);
+    } catch (const Standard_Failure&) {
+        return nullptr;
+    }
+}
+
+std::unique_ptr<TopoDS_Shape> builder_chamfer(
+    const TopoDS_Shape& solid,
+    const std::vector<TopoDS_Edge>& edges,
+    double distance)
+{
+    try {
+        if (edges.empty()) {
+            return std::make_unique<TopoDS_Shape>(solid);
+        }
+        BRepFilletAPI_MakeChamfer mk(solid);
+        for (const TopoDS_Edge& e : edges) {
+            if (e.IsNull()) continue;
+            mk.Add(distance, e);
+        }
+        mk.Build();
+        if (!mk.IsDone()) return nullptr;
+        TopoDS_Shape result = mk.Shape();
+        if (result.IsNull()) return nullptr;
+        // Like MakeFillet, MakeChamfer may wrap the result in a compound even if it contains only one solid.
+        // Extract the first solid so Solid::new's TopAbs_SOLID invariant holds.
+        if (result.ShapeType() != TopAbs_SOLID) {
+            TopExp_Explorer ex(result, TopAbs_SOLID);
+            if (!ex.More()) return nullptr;
+            result = ex.Current();
+        }
+        return std::make_unique<TopoDS_Shape>(result);
+    } catch (const Standard_Failure&) {
+        return nullptr;
+    }
 }
 
 // Extrude a closed profile wire into a solid via BRepPrimAPI_MakePrism.
@@ -1234,28 +1641,11 @@ std::unique_ptr<TopoDS_Shape> make_pipe_shell(
 
 // Loft (skin) a smooth solid through a sequence of cross-section wires.
 //
-// `all_edges` is a flattened list of all edges across all sections; the
-// `section_sizes` array tells how many edges belong to each section. Example:
-//   sections [[a, b, c], [d, e], [f, g, h, i]]
-//   → all_edges = [a, b, c, d, e, f, g, h, i]
-//     section_sizes = [3, 2, 4]
-//
-// When `closed == true`, the first section's TopoDS_Wire is reused (NOT
-// copied) as the last section. OCCT's BRepOffsetAPI_ThruSections checks
-// `myWires(1).IsSame(myWires(nbSects))` (TShape* pointer identity) and
-// switches to a v-direction periodic surface internally — see
-// BRepOffsetAPI_ThruSections.cxx lines 539, 691, and 1187-1189. The
-// resulting surface is C² continuous across the wrap-around because the
-// underlying GeomFill_AppSurf processes all sections at once with periodic
-// boundary conditions. Crucially we must NOT BRepBuilderAPI_Copy the wire
-// — that would assign a fresh TShape* and the IsSame() check would fail,
-// silently degrading to an open loft.
-//
-// `isSolid=true` requests OCCT cap the open ends with planar faces (when
-// `closed=false`); `isRuled=false` requests B-spline (smoothed) interpolation
-// rather than panel-by-panel ruled surfaces — necessary for the C² guarantee.
-// Loft (skin) through cross-section wires.  Sections in `all_edges` are
-// separated by null-edge sentinels.
+// `all_edges` is a flat edge list with sections delimited by null-edge
+// sentinels (TopoDS_Edge().IsNull()); ≥2 sections required. Built via
+// BRepOffsetAPI_ThruSections with isSolid=true (cap open ends with planar
+// faces) and isRuled=false (B-spline / C² smoothed interpolation rather
+// than per-panel ruled surfaces).
 std::unique_ptr<TopoDS_Shape> make_loft(
     const std::vector<TopoDS_Edge>& all_edges)
 {
@@ -1309,54 +1699,108 @@ std::unique_ptr<TopoDS_Shape> make_bspline_solid(
         if (coords.size() != static_cast<size_t>(nu) * nv * 3) return nullptr;
         if (nu < 2 || nv < 3) return nullptr;
 
-        // Augment for periodicity: duplicate first row/col at the end so that
-        // the grid is geometrically closed in the periodic direction(s).
-        // V is ALWAYS periodic (closed cross-section); U only when u_periodic.
-        const uint32_t u_extra = u_periodic ? 1u : 0u;
-        const uint32_t v_extra = 1u;
-        const uint32_t total_u = nu + u_extra;
-        const uint32_t total_v = nv + v_extra;
+        // Tensor-product truly-periodic interpolation (#120).
+        //
+        // Naive approach (Interpolate over augmented grid → SetUPeriodic) only
+        // delivers C^0 at the seam: the non-periodic interpolator picks
+        // independent boundary derivatives at u_min vs u_max, and SetUPeriodic
+        // just relabels topology without fixing the derivative mismatch.
+        //
+        // Instead we apply GeomAPI_Interpolate (which honors a true periodic
+        // boundary by solving a circulant linear system) once per V column,
+        // then once per U row of the resulting intermediate poles. The final
+        // poles array feeds Geom_BSplineSurface(...) directly with the
+        // UPeriodic / VPeriodic flags, yielding C^(degree-1) continuity at
+        // both seams.
+        using HPntArray  = NCollection_HArray1<gp_Pnt>;
+        using HRealArray = NCollection_HArray1<double>;
+        const double tol = Precision::Confusion();
 
-        NCollection_Array2<gp_Pnt> pts(1, static_cast<int>(total_u), 1, static_cast<int>(total_v));
-        for (uint32_t i = 0; i < total_u; ++i) {
-            const uint32_t src_i = (i >= nu) ? 0u : i;
-            for (uint32_t j = 0; j < total_v; ++j) {
-                const uint32_t src_j = (j >= nv) ? 0u : j;
-                const size_t idx = (static_cast<size_t>(src_i) * nv + src_j) * 3;
-                pts.SetValue(
-                    static_cast<int>(i) + 1,
-                    static_cast<int>(j) + 1,
-                    gp_Pnt(coords[idx], coords[idx + 1], coords[idx + 2]));
+        // Build uniform parameter arrays so that every column / row uses the
+        // SAME parametrization. With chord-length (the Interpolate default),
+        // columns of different total length get different knot vectors and
+        // the resulting tensor surface has parameter mismatches at +X axis
+        // (visible as boolean-intersect degeneracies). Uniform params avoid
+        // this since the input grid samples φ / θ at constant fractional
+        // intervals along each direction.
+        const int u_param_count = static_cast<int>(u_periodic ? nu + 1 : nu);
+        Handle(HRealArray) u_params = new HRealArray(1, u_param_count);
+        for (int k = 0; k < u_param_count; ++k) {
+            u_params->SetValue(k + 1, static_cast<double>(k) / static_cast<double>(nu));
+        }
+        Handle(HRealArray) v_params = new HRealArray(1, static_cast<int>(nv + 1));
+        for (uint32_t k = 0; k <= nv; ++k) {
+            v_params->SetValue(static_cast<int>(k) + 1,
+                               static_cast<double>(k) / static_cast<double>(nv));
+        }
+
+        // Stage 1: per-V-column interpolation along U with uniform params.
+        std::vector<Handle(Geom_BSplineCurve)> u_curves;
+        u_curves.reserve(nv);
+        for (uint32_t j = 0; j < nv; ++j) {
+            Handle(HPntArray) col = new HPntArray(1, static_cast<int>(nu));
+            for (uint32_t i = 0; i < nu; ++i) {
+                const size_t idx = (static_cast<size_t>(i) * nv + j) * 3;
+                col->SetValue(static_cast<int>(i) + 1,
+                              gp_Pnt(coords[idx], coords[idx + 1], coords[idx + 2]));
+            }
+            GeomAPI_Interpolate interp(col, u_params, u_periodic, tol);
+            interp.Perform();
+            if (!interp.IsDone()) return nullptr;
+            u_curves.push_back(interp.Curve());
+        }
+
+        // Capture U knot vector / multiplicities / degree from any column;
+        // GeomAPI_Interpolate uses the same chord-length parametrization for
+        // all columns since the V coordinate is uniform per column.
+        const int u_degree = u_curves[0]->Degree();
+        const int u_npoles = u_curves[0]->NbPoles();
+        const NCollection_Array1<double>& u_knots = u_curves[0]->Knots();
+        const NCollection_Array1<int>&    u_mults = u_curves[0]->Multiplicities();
+
+        NCollection_Array2<gp_Pnt> intermediate(1, u_npoles, 1, static_cast<int>(nv));
+        for (uint32_t j = 0; j < nv; ++j) {
+            for (int i = 1; i <= u_npoles; ++i) {
+                intermediate.SetValue(i, static_cast<int>(j) + 1, u_curves[j]->Pole(i));
             }
         }
 
-        // Interpolate a B-spline surface through the augmented grid.
-        Handle(Geom_BSplineSurface) surface;
-        try {
-            GeomAPI_PointsToBSplineSurface fitter;
-            fitter.Interpolate(pts);
-            if (!fitter.IsDone()) return nullptr;
-            surface = fitter.Surface();
-        } catch (const Standard_Failure&) {
-            return nullptr;
+        // Stage 2: per-U-row interpolation along V (V is always periodic).
+        std::vector<Handle(Geom_BSplineCurve)> v_curves;
+        v_curves.reserve(u_npoles);
+        for (int i = 1; i <= u_npoles; ++i) {
+            Handle(HPntArray) row = new HPntArray(1, static_cast<int>(nv));
+            for (uint32_t j = 0; j < nv; ++j) {
+                row->SetValue(static_cast<int>(j) + 1, intermediate(i, static_cast<int>(j) + 1));
+            }
+            GeomAPI_Interpolate interp(row, v_params, /*periodic=*/true, tol);
+            interp.Perform();
+            if (!interp.IsDone()) return nullptr;
+            v_curves.push_back(interp.Curve());
         }
+
+        const int v_degree = v_curves[0]->Degree();
+        const int v_npoles = v_curves[0]->NbPoles();
+        const NCollection_Array1<double>& v_knots = v_curves[0]->Knots();
+        const NCollection_Array1<int>&    v_mults = v_curves[0]->Multiplicities();
+
+        // Stage 3: assemble final M_pole × N_pole pole grid and build the
+        // surface with explicit periodic flags.
+        NCollection_Array2<gp_Pnt> final_poles(1, u_npoles, 1, v_npoles);
+        for (int i = 1; i <= u_npoles; ++i) {
+            for (int j = 1; j <= v_npoles; ++j) {
+                final_poles.SetValue(i, j, v_curves[i - 1]->Pole(j));
+            }
+        }
+
+        Handle(Geom_BSplineSurface) surface = new Geom_BSplineSurface(
+            final_poles,
+            u_knots, v_knots,
+            u_mults, v_mults,
+            u_degree, v_degree,
+            /*UPeriodic=*/u_periodic,
+            /*VPeriodic=*/true);
         if (surface.IsNull()) return nullptr;
-
-        // Promote geometric closure to B-spline periodicity.
-        // SetVPeriodic/SetUPeriodic require pole rows/cols to match within
-        // tolerance — the augmentation above ensures that.
-        try {
-            surface->SetVPeriodic();
-        } catch (const Standard_Failure&) {
-            // Fall through: non-periodic V; sewing may still close it.
-        }
-        if (u_periodic) {
-            try {
-                surface->SetUPeriodic();
-            } catch (const Standard_Failure&) {
-                // Fall through.
-            }
-        }
 
         // Side face spans the full parametric domain.
         double u1, u2, v1, v2;
@@ -1470,7 +1914,11 @@ static void collect_face_colors(
     }
 }
 
-std::unique_ptr<ColoredStepData> read_step_color_stream(RustReader& reader) {
+std::unique_ptr<TopoDS_Shape> read_step_color_stream(
+    RustReader&          reader,
+    rust::Vec<uint64_t>& out_ids,
+    rust::Vec<float>&    out_rgb)
+{
     try {
         // Create XDE document directly — avoids XCAFApp_Application which
         // pulls in visualization libs (TKXCAFPrs/TKTPrsStd) built with
@@ -1509,61 +1957,32 @@ std::unique_ptr<ColoredStepData> read_step_color_stream(RustReader& reader) {
         std::unordered_map<uint64_t, std::array<float, 3>> colorMap;
         collect_face_colors(doc, colorTool, colorMap);
 
-        auto result = std::make_unique<ColoredStepData>();
-        result->shape = compound;
+        // Recover Solids from disjoint shells / loose faces (#129); also
+        // remaps colorMap keys for faces whose TShape* changed during sewing.
+        TopoDS_Shape post = try_sew_orphan_faces(compound, &colorMap);
 
-        // Emit colors for each face that has a color entry.
-        for (TopExp_Explorer ex(compound, TopAbs_FACE); ex.More(); ex.Next()) {
+        // Emit colors — walk POST-processed shape so new TShape* are picked up.
+        for (TopExp_Explorer ex(post, TopAbs_FACE); ex.More(); ex.Next()) {
             uint64_t id =
                 reinterpret_cast<uint64_t>(ex.Current().TShape().get());
             auto it = colorMap.find(id);
             if (it == colorMap.end()) continue;
-            result->ids.push_back(id);
-            result->r.push_back(it->second[0]);
-            result->g.push_back(it->second[1]);
-            result->b.push_back(it->second[2]);
+            out_ids.push_back(id);
+            out_rgb.push_back(it->second[0]);
+            out_rgb.push_back(it->second[1]);
+            out_rgb.push_back(it->second[2]);
         }
 
-        return result;
+        return std::make_unique<TopoDS_Shape>(post);
     } catch (const Standard_Failure&) {
         return nullptr;
     }
 }
 
-std::unique_ptr<TopoDS_Shape> colored_step_shape(const ColoredStepData& d) {
-    return std::make_unique<TopoDS_Shape>(d.shape);
-}
-
-rust::Vec<uint64_t> colored_step_ids(const ColoredStepData& d) {
-    rust::Vec<uint64_t> v;
-    for (uint64_t x : d.ids) v.push_back(x);
-    return v;
-}
-
-rust::Vec<float> colored_step_colors_r(const ColoredStepData& d) {
-    rust::Vec<float> v;
-    for (float x : d.r) v.push_back(x);
-    return v;
-}
-
-rust::Vec<float> colored_step_colors_g(const ColoredStepData& d) {
-    rust::Vec<float> v;
-    for (float x : d.g) v.push_back(x);
-    return v;
-}
-
-rust::Vec<float> colored_step_colors_b(const ColoredStepData& d) {
-    rust::Vec<float> v;
-    for (float x : d.b) v.push_back(x);
-    return v;
-}
-
 bool write_step_color_stream(
     const TopoDS_Shape&         shape,
     rust::Slice<const uint64_t> ids,
-    rust::Slice<const float>    cr,
-    rust::Slice<const float>    cg,
-    rust::Slice<const float>    cb,
+    rust::Slice<const float>    rgb,
     RustWriter&                 writer)
 {
     try {
@@ -1580,7 +1999,7 @@ bool write_step_color_stream(
         // Build TShape* → color lookup from the Rust-supplied arrays.
         std::unordered_map<uint64_t, std::array<float, 3>> colorLookup;
         for (size_t i = 0; i < ids.size(); i++) {
-            colorLookup[ids[i]] = {cr[i], cg[i], cb[i]};
+            colorLookup[ids[i]] = {rgb[3*i], rgb[3*i+1], rgb[3*i+2]};
         }
 
         // For each colored face, find/create its sub-shape label and set color.
@@ -1613,52 +2032,6 @@ bool write_step_color_stream(
     } catch (const Standard_Failure&) {
         return false;
     }
-}
-
-// ==================== Clean with face-origin mapping ====================
-
-std::unique_ptr<CleanShape> clean_shape_full(const TopoDS_Shape& shape) {
-    try {
-        ShapeUpgrade_UnifySameDomain unifier(shape, true, true, true);
-        unifier.AllowInternalEdges(false);
-        unifier.Build();
-
-        auto r = std::make_unique<CleanShape>();
-        r->shape = unifier.Shape();
-
-        Handle(BRepTools_History) history = unifier.History();
-        if (!history.IsNull()) {
-            for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
-                const TopoDS_Shape& old_face = ex.Current();
-                uint64_t old_id = reinterpret_cast<uint64_t>(old_face.TShape().get());
-                if (history->IsRemoved(old_face)) continue;
-                const NCollection_List<TopoDS_Shape>& mods = history->Modified(old_face);
-                if (mods.IsEmpty()) {
-                    // Unchanged: TShape* is the same in the result.
-                    r->mapping.push_back(old_id);
-                    r->mapping.push_back(old_id);
-                } else {
-                    // Merged: use only the first resulting face (first-found wins).
-                    uint64_t new_id = reinterpret_cast<uint64_t>(mods.First().TShape().get());
-                    r->mapping.push_back(new_id);
-                    r->mapping.push_back(old_id);
-                }
-            }
-        }
-        return r;
-    } catch (const Standard_Failure&) {
-        return nullptr;
-    }
-}
-
-std::unique_ptr<TopoDS_Shape> clean_shape_get(const CleanShape& r) {
-    return std::make_unique<TopoDS_Shape>(r.shape);
-}
-
-rust::Vec<uint64_t> clean_shape_mapping(const CleanShape& r) {
-    rust::Vec<uint64_t> v;
-    for (uint64_t x : r.mapping) v.push_back(x);
-    return v;
 }
 
 } // namespace cadrum

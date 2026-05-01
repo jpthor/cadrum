@@ -20,13 +20,6 @@ fn test_translated_preserves_volume() {
 }
 
 #[test]
-fn test_translated_preserves_shell_count() {
-	let shape = test_box();
-	let moved = shape.translate(dvec3(5.0, 0.0, 0.0));
-	assert_eq!(moved.shell_count(), 1);
-}
-
-#[test]
 fn test_union_of_translated_overlapping_solids_has_single_volume() {
 	// 異なる場所に同じ大きさの立方体を2つ作り、translatedで同じ場所に重ねてからunionする。
 	// 結果のvolumeは1つ分（1000）になるはず。
@@ -70,10 +63,10 @@ fn test_rotated_full_turn_preserves_volume() {
 }
 
 #[test]
-fn test_rotated_preserves_shell_count() {
+fn test_rotated_y_preserves_volume() {
 	let shape = test_box();
 	let rotated = shape.rotate_y(std::f64::consts::FRAC_PI_2);
-	assert_eq!(rotated.shell_count(), 1);
+	assert!((rotated.volume() - 1000.0).abs() < 1e-3);
 }
 
 // ==================== scale ====================
@@ -95,10 +88,11 @@ fn test_scale_half_volume() {
 }
 
 #[test]
-fn test_scale_preserves_shell_count() {
+fn test_scale_triple_volume() {
 	let shape = test_box();
+	// 3× uniform scale → volume × 27
 	let scaled = shape.scale(DVec3::ZERO, 3.0);
-	assert_eq!(scaled.shell_count(), 1);
+	assert!((scaled.volume() - 27_000.0).abs() < 1e-3);
 }
 
 // ==================== face id preservation ====================
@@ -106,35 +100,62 @@ fn test_scale_preserves_shell_count() {
 #[test]
 fn test_preserves_face_ids() {
 	fn face_ids<'a>(s: impl IntoIterator<Item = &'a Solid>) -> Vec<u64> {
-		s.into_iter().flat_map(|s| s.face_iter()).map(|f| f.tshape_id()).collect()
+		s.into_iter().flat_map(|s| s.iter_face()).map(|f| f.id()).collect()
 	}
 
 	let shape = test_box();
-	let solid_id = shape.tshape_id();
+	let solid_id = shape.id();
 	let ids = face_ids([&shape]);
 	let moved = shape.translate(dvec3(10.0, 0.0, 0.0));
-	assert_eq!(solid_id, moved.tshape_id(), "translate should preserve solid tshape_id");
+	assert_eq!(solid_id, moved.id(), "translate should preserve solid tshape_id");
 	assert_eq!(ids, face_ids([&moved]), "translate should preserve face IDs");
 
 	let shape = test_box();
-	let solid_id = shape.tshape_id();
+	let solid_id = shape.id();
 	let ids = face_ids([&shape]);
 	let rotated = shape.rotate_z(std::f64::consts::FRAC_PI_4);
-	assert_eq!(solid_id, rotated.tshape_id(), "rotate should preserve solid tshape_id");
+	assert_eq!(solid_id, rotated.id(), "rotate should preserve solid tshape_id");
 	assert_eq!(ids, face_ids([&rotated]), "rotate should preserve face IDs");
 }
 
-// ==================== is_tool_face / is_shape_face (B fully inside A) ====================
+// ==================== face-edge incidence (Edge::id + Face::iter_edge) ====================
+
+#[test]
+fn test_face_edge_incidence_via_id() {
+	// 立方体は 12 unique edge を持ち、各 face に 4 edge ずつ。
+	// 各 edge は 2 face で共有されるので Σ face.iter_edge() = 24 = 12*2。
+	let cube = test_box();
+	let total_face_edges: usize = cube.iter_face().map(|f| f.iter_edge().count()).sum();
+	assert_eq!(cube.iter_edge().count(), 12, "cube has 12 unique edges");
+	assert_eq!(total_face_edges, 24, "each edge is shared between 2 faces");
+
+	// ある edge が「どの face に属しているか」を id 比較で正しく判定できる。
+	for edge in cube.iter_edge() {
+		let owners = cube.iter_face().filter(|f| f.iter_edge().any(|e| e.id() == edge.id())).count();
+		assert_eq!(owners, 2, "every cube edge is shared by exactly 2 faces");
+	}
+}
+
+// ==================== iter_history (B fully inside A) ====================
 
 #[test]
 fn test_new_faces_subtract_b_inside_a() {
 	// small_box が big_box に完全に収まる → small の 6 面はすべて Modified されない
-	// 旧実装（collect_generated_faces）では Modified() が空 → tool faces = 0
-	// 新実装（from_b post_ids）では unchanged 面も from_b に入る → tool faces = 6
+	// 新実装（iter_history の post_id 集合）では unchanged 面も history に入る → tool faces = 6
 	let big = [Solid::cube(10.0, 10.0, 10.0)];
 	let small = [Solid::cube(4.0, 4.0, 4.0).translate(dvec3(3.0, 3.0, 3.0))];
-	let (solids, meta) = big.subtract_with_metadata(&small).unwrap();
-	assert_eq!(solids.iter().flat_map(|s| s.face_iter()).filter(|f| cadrum::is_tool_face(&meta, f)).count(), 6, "subtract with B fully inside A: tool faces should be all 6 inner walls");
+	let small_face_ids: std::collections::HashSet<u64> =
+		small.iter().flat_map(|s| s.iter_face()).map(|f| f.id()).collect();
+	let solids = big.subtract(&small).unwrap();
+	let tool_post_ids: std::collections::HashSet<u64> = solids.iter()
+		.flat_map(|s| s.iter_history())
+		.filter_map(|[post, src]| small_face_ids.contains(&src).then_some(post))
+		.collect();
+	assert_eq!(
+		solids.iter().flat_map(|s| s.iter_face()).filter(|f| tool_post_ids.contains(&f.id())).count(),
+		6,
+		"subtract with B fully inside A: tool faces should be all 6 inner walls"
+	);
 }
 
 #[test]
@@ -143,10 +164,16 @@ fn test_new_faces_intersect_b_inside_a() {
 	// small の 6 面はすべて unchanged → tool faces = 結果の全フェイス = 6
 	let big = [Solid::cube(10.0, 10.0, 10.0)];
 	let small = [Solid::cube(4.0, 4.0, 4.0).translate(dvec3(3.0, 3.0, 3.0))];
-	let (solids, meta) = big.intersect_with_metadata(&small).unwrap();
-	let tool_count = solids.iter().flat_map(|s| s.face_iter()).filter(|f| cadrum::is_tool_face(&meta, f)).count();
+	let small_face_ids: std::collections::HashSet<u64> =
+		small.iter().flat_map(|s| s.iter_face()).map(|f| f.id()).collect();
+	let solids = big.intersect(&small).unwrap();
+	let tool_post_ids: std::collections::HashSet<u64> = solids.iter()
+		.flat_map(|s| s.iter_history())
+		.filter_map(|[post, src]| small_face_ids.contains(&src).then_some(post))
+		.collect();
+	let tool_count = solids.iter().flat_map(|s| s.iter_face()).filter(|f| tool_post_ids.contains(&f.id())).count();
 	assert_eq!(tool_count, 6, "intersect with B fully inside A: tool faces should equal all faces of result");
-	assert_eq!(solids.iter().flat_map(|s| s.face_iter()).count(), tool_count, "intersect with B fully inside A: tool faces should cover all result faces");
+	assert_eq!(solids.iter().flat_map(|s| s.iter_face()).count(), tool_count, "intersect with B fully inside A: tool faces should cover all result faces");
 }
 
 // ==================== bounding_box ====================

@@ -1,8 +1,8 @@
 [package]
 name = "cadrum"
-version = "0.6.1"
+version = "0.7.4"
 edition = "2021"
-description = "Rust CAD library powered by statically linked, headless OpenCASCADE (OCCT 8.0.0-rc5)"
+description = "Rust CAD library powered by statically linked, headless OpenCASCADE (OCCT 8.0.0-beta1)"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/lzpel/cadrum"
@@ -23,7 +23,7 @@ source-build = ["dep:cmake"]
 
 [dependencies]
 cxx = "1"
-glam = { version = "0.29", features = ["std"] }
+glam = { version = ">=0.29", features = ["std"] }
 
 
 [build-dependencies]
@@ -35,10 +35,12 @@ tar = "0.4"
 walkdir = "2"
 # source-build only: build OCCT from upstream sources
 cmake = { version = "0.1", optional = true }
+# source-build + CADRUM_BUNDLE_GCC_RUNTIME: query the target compiler for libstdc++.a path
+cc = "1"
 
-[package.metadata.docs.rs]
-targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
-rustdoc-args = ["--cfg", "docsrs"]
+[dev-dependencies]
+# Used by examples/codegen.rs to parse traits.rs and rewrite marker regions.
+regex = "1"
 
 # Examples that depend on the `color` feature. Cargo will skip building these
 # under `--no-default-features`. Examples without a `[[example]]` entry
@@ -64,6 +66,10 @@ name = "06_loft"
 
 [[example]]
 name = "07_sweep"
+required-features = ["color"]
+
+[[example]]
+name = "08_shell"
 required-features = ["color"]
 
 [[example]]

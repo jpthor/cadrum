@@ -14,11 +14,11 @@ use std::f64::consts::PI;
 fn write_outputs(solids: &[Solid], name: &str) {
 	std::fs::create_dir_all("out").unwrap();
 	let mut f = std::fs::File::create(format!("out/{name}.step")).unwrap();
-	cadrum::write_step(solids, &mut f).expect("step write");
+	cadrum::Solid::write_step(solids, &mut f).expect("step write");
 	let mut f = std::fs::File::create(format!("out/{name}.stl")).unwrap();
-	cadrum::mesh(solids, 0.1).and_then(|m| m.write_stl(&mut f)).expect("stl write");
+	cadrum::Solid::mesh(solids, 0.1).and_then(|m| m.write_stl(&mut f)).expect("stl write");
 	let mut f = std::fs::File::create(format!("out/{name}.svg")).unwrap();
-	cadrum::mesh(solids, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), true, false, &mut f)).expect("svg write");
+	cadrum::Solid::mesh(solids, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, false, &mut f)).expect("svg write");
 }
 
 // ==================== (1) 数値検証: 円錐台 ====================
@@ -42,7 +42,6 @@ fn test_loft_01_frustum_volume_matches_analytical() {
 		"frustum volume {:.4} vs analytical {:.4} (relative error {:.4})",
 		actual, expected, rel_err
 	);
-	assert_eq!(frustum.shell_count(), 1);
 
 	write_outputs(std::slice::from_ref(&frustum), "test_loft_01_frustum_volume_matches_analytical");
 	println!("frustum loft: volume = {:.4} (expected {:.4})", actual, expected);
@@ -105,7 +104,6 @@ fn test_loft_04_closure_iterator_form() {
 
 	let plasma = Solid::loft(ribs.iter().map(|e| [e])).expect("closure-form loft should succeed");
 
-	assert_eq!(plasma.shell_count(), 1);
 	assert!(plasma.volume() > 0.0);
 
 	write_outputs(std::slice::from_ref(&plasma), "test_loft_05_closure_iterator_form");

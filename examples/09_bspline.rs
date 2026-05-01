@@ -1,5 +1,4 @@
-use cadrum::Solid;
-use glam::{DQuat, DVec3};
+use cadrum::{DQuat, DVec3, Solid};
 use std::f64::consts::TAU;
 
 // 2 field-period stellarator-like torus.
@@ -37,12 +36,11 @@ fn point(i: usize, j: usize) -> DVec3 {
 fn main() {
 	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
 
-	let grid: [[DVec3; N]; M] = std::array::from_fn(|i| std::array::from_fn(|j| point(i, j)));
-	let plasma = Solid::bspline(grid, true).expect("2-period bspline torus should succeed");
+	let plasma = Solid::bspline(M, N, true, point).expect("2-period bspline torus should succeed");
 	let objects = [plasma.color("cyan")];
 	let mut f = std::fs::File::create(format!("{example_name}.step")).unwrap();
-	cadrum::write_step(&objects, &mut f).unwrap();
+	Solid::write_step(&objects, &mut f).unwrap();
 	let mut f_svg = std::fs::File::create(format!("{example_name}.svg")).unwrap();
-	cadrum::mesh(&objects, 0.1).and_then(|m| m.write_svg(DVec3::new(0.05, 0.05, 1.0), false, true, &mut f_svg)).unwrap();
-	eprintln!("wrote {0}.step / {0}.svg", example_name);
+	Solid::mesh(&objects, 0.1).and_then(|m| m.write_svg(DVec3::new(0.05, 0.05, 1.0), DVec3::Y, false, true, &mut f_svg)).unwrap();
+	println!("wrote {example_name}.step / {example_name}.svg");
 }

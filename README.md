@@ -7,16 +7,23 @@
 Rust CAD library powered by statically linked, headless [OpenCASCADE](https://dev.opencascade.org/) (OCCT 8.0.0-rc5).
 
 <p align="center">
+  <img src="https://raw.githubusercontent.com/lzpel/alphastell/main/figure/image.png" alt="cadrum"/>
+</p>
+<!--
+<p align="center">
   <img src="figure/chijin.svg" alt="chijin — a drum of Amami Oshima" width="360"/>
 </p>
+-->
 
 ## Usage
 
 | [primitives](#primitives) | [write read](#write-read) | [transform](#transform) | [boolean](#boolean) |
 |:---:|:---:|:---:|:---:|
 | [<img src="https://lzpel.github.io/cadrum/01_primitives.svg" width="180" alt="primitives"/>](#primitives) | [<img src="https://lzpel.github.io/cadrum/02_write_read.svg" width="180" alt="write read"/>](#write-read) | [<img src="https://lzpel.github.io/cadrum/03_transform.svg" width="180" alt="transform"/>](#transform) | [<img src="https://lzpel.github.io/cadrum/04_boolean.svg" width="180" alt="boolean"/>](#boolean) |
-| [extrude](#extrude) | [loft](#loft) | [sweep](#sweep) | [bspline](#bspline) |
-| [<img src="https://lzpel.github.io/cadrum/05_extrude.svg" width="180" alt="extrude"/>](#extrude) | [<img src="https://lzpel.github.io/cadrum/06_loft.svg" width="180" alt="loft"/>](#loft) | [<img src="https://lzpel.github.io/cadrum/07_sweep.svg" width="180" alt="sweep"/>](#sweep) | [<img src="https://lzpel.github.io/cadrum/08_bspline.svg" width="180" alt="bspline"/>](#bspline) |
+| [extrude](#extrude) | [loft](#loft) | [sweep](#sweep) | [shell](#shell) |
+| [<img src="https://lzpel.github.io/cadrum/05_extrude.svg" width="180" alt="extrude"/>](#extrude) | [<img src="https://lzpel.github.io/cadrum/06_loft.svg" width="180" alt="loft"/>](#loft) | [<img src="https://lzpel.github.io/cadrum/07_sweep.svg" width="180" alt="sweep"/>](#sweep) | [<img src="https://lzpel.github.io/cadrum/08_shell.svg" width="180" alt="shell"/>](#shell) |
+| [bspline](#bspline) | [fillet](#fillet) | [chamfer](#chamfer) |  |
+| [<img src="https://lzpel.github.io/cadrum/09_bspline.svg" width="180" alt="bspline"/>](#bspline) | [<img src="https://lzpel.github.io/cadrum/10_fillet.svg" width="180" alt="fillet"/>](#fillet) | [<img src="https://lzpel.github.io/cadrum/11_chamfer.svg" width="180" alt="chamfer"/>](#chamfer) |  |
 
 More examples with source code are available at [lzpel.github.io/cadrum](https://lzpel.github.io/cadrum).
 
@@ -24,7 +31,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cadrum = "^0.6"
+cadrum = "^0.7"
 ```
 
 ## Build
@@ -62,8 +69,7 @@ cargo run --example 01_primitives
 ```rust
 //! Primitive solids: box, cylinder, sphere, cone, torus — colored and exported as STEP + SVG.
 
-use cadrum::Solid;
-use glam::DVec3;
+use cadrum::{DVec3, Solid};
 
 fn main() {
     let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
@@ -72,24 +78,24 @@ fn main() {
         Solid::cube(10.0, 20.0, 30.0)
             .color("#4a90d9"),
         Solid::cylinder(8.0, DVec3::Z, 30.0)
-            .translate(DVec3::new(30.0, 0.0, 0.0))
+            .translate(DVec3::X * 30.0)
             .color("#e67e22"),
         Solid::sphere(8.0)
-            .translate(DVec3::new(60.0, 0.0, 15.0))
+            .translate(DVec3::X * 60.0 + DVec3::Z * 15.0)
             .color("#2ecc71"),
         Solid::cone(8.0, 0.0, DVec3::Z, 30.0)
-            .translate(DVec3::new(90.0, 0.0, 0.0))
+            .translate(DVec3::X * 90.0)
             .color("#e74c3c"),
         Solid::torus(12.0, 4.0, DVec3::Z)
-            .translate(DVec3::new(130.0, 0.0, 15.0))
+            .translate(DVec3::X * 130.0 + DVec3::Z * 15.0)
             .color("#9b59b6"),
     ];
 
     let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create file");
-    cadrum::write_step(&solids, &mut f).expect("failed to write STEP");
+    Solid::write_step(&solids, &mut f).expect("failed to write STEP");
 
     let mut svg = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
-    cadrum::mesh(&solids, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 1.0), true, false, &mut svg)).expect("failed to write SVG");
+    Solid::mesh(&solids, 0.5).and_then(|m| m.write_svg(DVec3::ONE, DVec3::Z, true, false, &mut svg)).expect("failed to write SVG");
 }
 
 ```
@@ -110,8 +116,7 @@ cargo run --example 02_write_read
 ```rust
 //! Read and write: chain STEP, BRep text, and BRep binary round-trips with progressive rotation.
 
-use cadrum::{Solid, Transform};
-use glam::DVec3;
+use cadrum::{Compound, DVec3, Solid};
 use std::f64::consts::FRAC_PI_8;
 
 fn main() -> Result<(), cadrum::Error> {
@@ -122,24 +127,24 @@ fn main() -> Result<(), cadrum::Error> {
 
     // 0. Original: read colored_box.step
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let original = cadrum::read_step(
+    let original = Solid::read_step(
         &mut std::fs::File::open(format!("{manifest_dir}/steps/colored_box.step")).expect("open file"),
     )?;
 
     // 1. STEP round-trip: rotate 30° → write → read
     let a_written = original.clone().rotate_x(FRAC_PI_8);
-    cadrum::write_step(&a_written, &mut std::fs::File::create(&step_path).expect("create file"))?;
-    let a = cadrum::read_step(&mut std::fs::File::open(&step_path).expect("open file"))?;
+    Solid::write_step(&a_written, &mut std::fs::File::create(&step_path).expect("create file"))?;
+    let a = Solid::read_step(&mut std::fs::File::open(&step_path).expect("open file"))?;
 
     // 2. BRep text round-trip: rotate another 30° → write → read
     let b_written = a.clone().rotate_x(FRAC_PI_8);
-    cadrum::write_brep_text(&b_written, &mut std::fs::File::create(&text_path).expect("create file"))?;
-    let b = cadrum::read_brep_text(&mut std::fs::File::open(&text_path).expect("open file"))?;
+    Solid::write_brep_text(&b_written, &mut std::fs::File::create(&text_path).expect("create file"))?;
+    let b = Solid::read_brep_text(&mut std::fs::File::open(&text_path).expect("open file"))?;
 
     // 3. BRep binary round-trip: rotate another 30° → write → read
     let c_written = b.clone().rotate_x(FRAC_PI_8);
-    cadrum::write_brep_binary(&c_written, &mut std::fs::File::create(&brep_path).expect("create file"))?;
-    let c = cadrum::read_brep_binary(&mut std::fs::File::open(&brep_path).expect("open file"))?;
+    Solid::write_brep_binary(&c_written, &mut std::fs::File::create(&brep_path).expect("create file"))?;
+    let c = Solid::read_brep_binary(&mut std::fs::File::open(&brep_path).expect("open file"))?;
 
     // 4. Arrange side by side and export SVG + STL
     let [min, max] = original[0].bounding_box();
@@ -150,10 +155,10 @@ fn main() -> Result<(), cadrum::Error> {
         .collect();
 
     let mut svg = std::fs::File::create(format!("{example_name}.svg")).expect("create file");
-    cadrum::mesh(&all, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), true, false, &mut svg))?;
+    Solid::mesh(&all, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, false, &mut svg))?;
 
     let mut stl = std::fs::File::create(format!("{example_name}.stl")).expect("create file");
-    cadrum::mesh(&all, 0.1).and_then(|m| m.write_stl(&mut stl))?;
+    Solid::mesh(&all, 0.1).and_then(|m| m.write_stl(&mut stl))?;
 
     // 5. Print summary
     let stl_path = format!("{example_name}.stl");
@@ -186,8 +191,7 @@ cargo run --example 03_transform
 ```rust
 //! Transform operations: translate, rotate, scale, and mirror applied to a cone.
 
-use cadrum::Solid;
-use glam::DVec3;
+use cadrum::{DVec3, Solid};
 use std::f64::consts::PI;
 
 fn main() {
@@ -202,29 +206,29 @@ fn main() {
         // translate — shift +20 along Z
         base.clone()
             .color("#4a90d9")
-            .translate(DVec3::new(40.0, 0.0, 20.0)),
+            .translate(DVec3::X * 40.0 + DVec3::Z * 20.0),
         // rotate — 90° around X axis so the cone tips toward Y
         base.clone()
             .color("#e67e22")
             .rotate_x(PI / 2.0)
-            .translate(DVec3::new(80.0, 0.0, 0.0)),
+            .translate(DVec3::X * 80.0),
         // scaled — 1.5x from its local origin
         base.clone()
             .color("#2ecc71")
             .scale(DVec3::ZERO, 1.5)
-            .translate(DVec3::new(120.0, 0.0, 0.0)),
+            .translate(DVec3::X * 120.0),
         // mirror — flip across Z=0 plane so the tip points down
         base.clone()
             .color("#e74c3c")
             .mirror(DVec3::ZERO, DVec3::Z)
-            .translate(DVec3::new(160.0, 0.0, 0.0)),
+            .translate(DVec3::X * 160.0),
     ];
 
     let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create file");
-    cadrum::write_step(&solids, &mut f).expect("failed to write STEP");
+    Solid::write_step(&solids, &mut f).expect("failed to write STEP");
 
     let mut svg = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
-    cadrum::mesh(&solids, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 1.0), true, false, &mut svg)).expect("failed to write SVG");
+    Solid::mesh(&solids, 0.5).and_then(|m| m.write_svg(DVec3::ONE, DVec3::Z, true, false, &mut svg)).expect("failed to write SVG");
 }
 
 ```
@@ -245,8 +249,7 @@ cargo run --example 04_boolean
 ```rust
 //! Boolean operations: union, subtract, and intersect between a box and a cylinder.
 
-use cadrum::{Solid, Transform};
-use glam::DVec3;
+use cadrum::{Compound, DVec3, Solid};
 
 fn main() -> Result<(), cadrum::Error> {
     let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
@@ -264,20 +267,20 @@ fn main() -> Result<(), cadrum::Error> {
     // subtract: box minus cylinder — offset X=40
     let subtract = make_box
         .subtract(&[make_cyl.clone()])?
-        .translate(DVec3::new(40.0, 0.0, 0.0));
+        .translate(DVec3::X * 40.0);
 
     // intersect: only the overlapping volume — offset X=80
     let intersect = make_box
         .intersect(&[make_cyl])?
-        .translate(DVec3::new(80.0, 0.0, 0.0));
+        .translate(DVec3::X * 80.0);
 
     let shapes: Vec<Solid> = [union, subtract, intersect].concat();
 
     let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create file");
-    cadrum::write_step(&shapes, &mut f).expect("failed to write STEP");
+    Solid::write_step(&shapes, &mut f).expect("failed to write STEP");
 
     let mut svg = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
-    cadrum::mesh(&shapes, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), true, false, &mut svg)).expect("failed to write SVG");
+    Solid::mesh(&shapes, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, false, &mut svg)).expect("failed to write SVG");
 
     Ok(())
 }
@@ -305,8 +308,7 @@ cargo run --example 05_extrude
 //! - **L-beam**: L-shaped polygon extruded along Z
 //! - **Heart**: BSpline heart-shaped profile extruded along Z
 
-use cadrum::{BSplineEnd, Edge, Error, Solid};
-use glam::DVec3;
+use cadrum::{BSplineEnd, DVec3, Edge, Error, Solid};
 
 /// Square polygon → box (simplest extrude).
 fn build_box() -> Result<Solid, Error> {
@@ -316,13 +318,13 @@ fn build_box() -> Result<Solid, Error> {
 		DVec3::new(5.0, 5.0, 0.0),
 		DVec3::new(0.0, 5.0, 0.0),
 	])?;
-	Solid::extrude(&profile, DVec3::new(0.0, 0.0, 8.0))
+	Solid::extrude(&profile, DVec3::Z * 8.0)
 }
 
 /// Circle extruded at a steep angle → oblique cylinder.
 fn build_oblique_cylinder() -> Result<Solid, Error> {
 	let profile = [Edge::circle(3.0, DVec3::Z)?];
-	Solid::extrude(&profile, DVec3::new(-4.0, 6.0, 8.0))
+	Solid::extrude(&profile, DVec3::new(-4.0, -6.0, 8.0))
 }
 
 /// L-shaped polygon → L-beam.
@@ -335,7 +337,7 @@ fn build_l_beam() -> Result<Solid, Error> {
 		DVec3::new(1.0, 3.0, 0.0),
 		DVec3::new(0.0, 3.0, 0.0),
 	])?;
-	Solid::extrude(&profile, DVec3::new(0.0, 0.0, 12.0))
+	Solid::extrude(&profile, DVec3::Z * 12.0)
 }
 
 /// Heart-shaped BSpline profile extruded along Z.
@@ -353,29 +355,26 @@ fn build_heart() -> Result<Solid, Error> {
 		],
 		BSplineEnd::Periodic,
 	)?];
-	Solid::extrude(&profile, DVec3::new(0.0, 0.0, 7.0))
+	Solid::extrude(&profile, DVec3::Z * 7.0)
 }
 
 fn main() -> Result<(), Error> {
 	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
 
 	let box_solid = build_box()?.color("#b0d4f1");
-	let oblique = build_oblique_cylinder()?.color("#f1c8b0").translate(DVec3::new(12.0, 0.0, 0.0));
-	let l_beam = build_l_beam()?.color("#b0f1c8").translate(DVec3::new(28.0, 0.0, 0.0));
-	let heart = build_heart()?.color("#f1b0b0").translate(DVec3::new(38.0, 0.0, 0.0));
+	let oblique = build_oblique_cylinder()?.color("#f1c8b0").translate(DVec3::X * 10.0);
+	let l_beam = build_l_beam()?.color("#b0f1c8").translate(DVec3::X * 20.0);
+	let heart = build_heart()?.color("#f1b0b0").translate(DVec3::X * 30.0);
 
 	let result = [box_solid, oblique, l_beam, heart];
 
-	let step_path = format!("{example_name}.step");
-	let mut f = std::fs::File::create(&step_path).expect("failed to create STEP file");
-	cadrum::write_step(&result, &mut f).expect("failed to write STEP");
-	println!("wrote {step_path}");
+	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
+	Solid::write_step(&result, &mut f).expect("failed to write STEP");
 
-	let svg_path = format!("{example_name}.svg");
-	let mut f = std::fs::File::create(&svg_path).expect("failed to create SVG file");
-	cadrum::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 1.0), true, false, &mut f)).expect("failed to write SVG");
-	println!("wrote {svg_path}");
+	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
+	Solid::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::ONE, DVec3::Z, true, false, &mut f)).expect("failed to write SVG");
 
+	println!("wrote {example_name}.step / {example_name}.svg");
 	Ok(())
 }
 
@@ -401,8 +400,7 @@ cargo run --example 06_loft
 //! - **Morph**: square polygon → circle (cross-section shape transition)
 //! - **Tilted**: three non-parallel circular sections → twisted loft
 
-use cadrum::{Edge, Error, Solid};
-use glam::DVec3;
+use cadrum::{DVec3, Edge, Error, Solid};
 
 /// Two circles → frustum (minimal loft example).
 fn build_frustum() -> Result<Solid, Error> {
@@ -429,7 +427,7 @@ fn build_morph() -> Result<Solid, Error> {
 fn build_tilted() -> Result<Solid, Error> {
 	let bottom = [Edge::circle(2.5, DVec3::Z)?];
 	let mid = [Edge::circle(2.0, DVec3::new(0.3, 0.0, 1.0).normalize())?
-		.translate(DVec3::new(1.0, 0.0, 5.0))];
+		.translate(DVec3::X + DVec3::Z * 5.0)];
 	let top = [Edge::circle(1.5, DVec3::new(-0.2, 0.3, 1.0).normalize())?
 		.translate(DVec3::new(-0.5, 1.0, 10.0))];
 
@@ -440,21 +438,18 @@ fn main() -> Result<(), Error> {
 	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
 
 	let frustum = build_frustum()?;
-	let morph = build_morph()?.translate(DVec3::new(10.0, 0.0, 0.0));
-	let tilted = build_tilted()?.translate(DVec3::new(20.0, 0.0, 0.0));
+	let morph = build_morph()?.translate(DVec3::X * 10.0);
+	let tilted = build_tilted()?.translate(DVec3::X * 20.0);
 
 	let result = [frustum, morph, tilted];
 
-	let step_path = format!("{example_name}.step");
-	let mut f = std::fs::File::create(&step_path).expect("failed to create STEP file");
-	cadrum::write_step(&result, &mut f).expect("failed to write STEP");
-	println!("wrote {step_path}");
+	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
+	cadrum::Solid::write_step(&result, &mut f).expect("failed to write STEP");
 
-	let svg_path = format!("{example_name}.svg");
-	let mut f = std::fs::File::create(&svg_path).expect("failed to create SVG file");
-	cadrum::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 1.0), true, false, &mut f)).expect("failed to write SVG");
-	println!("wrote {svg_path}");
+	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
+	cadrum::Solid::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::ONE, DVec3::Z, true, false, &mut f)).expect("failed to write SVG");
 
+	println!("wrote {example_name}.step / {example_name}.svg");
 	Ok(())
 }
 
@@ -495,8 +490,7 @@ cargo run --example 07_sweep
 //!   toward a parallel auxiliary spine. Arbitrary twist control — e.g. a
 //!   helical `aux_spine` on a straight `spine` produces a twisted ribbon.
 
-use cadrum::{Compound, Edge, Error, ProfileOrient, Solid, Transform};
-use glam::DVec3;
+use cadrum::{Compound, DVec3, Edge, Error, ProfileOrient, Solid, Wire};
 
 // ==================== Component 1: M2 ISO screw ====================
 
@@ -566,11 +560,12 @@ fn build_u_pipe() -> Result<Vec<Solid>, Error> {
 
 // ==================== Component 3: Auxiliary-spine twisted ribbon ====================
 
-// 直線 spine を `Auxiliary(&[helix])` で掃引すると、各点で profile の tracked 軸が
-// 対応するヘリックス点を向くように回転される。pitch=h のヘリックスは [0, h] の
-// あいだにちょうど 360° 一周するので、平たい長方形 profile は 1 回捻れた
-// リボンになる — `Fixed` や `Torsion` だと直線 spine では profile は全く
-// 回転しないので、ねじれが見えれば Auxiliary が効いている証拠。
+// Sweeping a straight spine with `Auxiliary(&[helix])` rotates the tracked
+// axis of the profile at each point to face the corresponding helix point.
+// A pitch=h helix makes exactly one 360° turn over [0, h], so a flat
+// rectangular profile becomes a ribbon twisted once. With `Fixed` or
+// `Torsion` the profile wouldn't rotate along a straight spine — visible
+// twist is therefore proof that Auxiliary is in effect.
 fn build_twisted_ribbon() -> Result<Vec<Solid>, Error> {
 	let h = 8.0;
 	let aux_r = 3.0;
@@ -578,7 +573,7 @@ fn build_twisted_ribbon() -> Result<Vec<Solid>, Error> {
 	let spine = Edge::line(DVec3::ZERO, DVec3::Z * h)?;
 	let aux = Edge::helix(aux_r, h, h, DVec3::Z, DVec3::X)?;
 
-	// 平たい長方形 (10:1 アスペクト) — 円や正方形ではねじれが見えない。
+	// Flat rectangle (10:1 aspect) — circles or squares wouldn't reveal any twist.
 	let profile = Edge::polygon(&[DVec3::new(-2.0, -0.2, 0.0), DVec3::new(2.0, -0.2, 0.0), DVec3::new(2.0, 0.2, 0.0), DVec3::new(-2.0, 0.2, 0.0)])?;
 
 	let ribbon = Solid::sweep(&profile, &[spine], ProfileOrient::Auxiliary(&[aux]))?;
@@ -591,15 +586,15 @@ fn build_twisted_ribbon() -> Result<Vec<Solid>, Error> {
 // origin, U-pipe at x=6, ribbon at x=12) and applies its color, so main
 // just concatenates them.
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Error> {
 	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
 	let all: Vec<Solid> = [build_m2_screw()?, build_u_pipe()?, build_twisted_ribbon()?].concat();
 
-	let mut f = std::fs::File::create(format!("{example_name}.step"))?;
-	cadrum::write_step(&all, &mut f)?;
-	let mut f_svg = std::fs::File::create(format!("{example_name}.svg"))?;
+	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
+	cadrum::Solid::write_step(&all, &mut f)?;
+	let mut f_svg = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
 	// Helical threads have dense hidden lines that clutter the SVG; disable them.
-	cadrum::mesh(&all, 0.5)?.write_svg(DVec3::new(1.0, 1.0, -1.0), false, false, &mut f_svg)?;
+	cadrum::Solid::mesh(&all, 0.5)?.write_svg(DVec3::new(1.0, 1.0, -1.0), DVec3::Z, false, false, &mut f_svg)?;
 	println!("wrote {example_name}.step / {example_name}.svg ({} solids)", all.len());
 	Ok(())
 }
@@ -611,15 +606,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   <img src="https://lzpel.github.io/cadrum/07_sweep.svg" alt="07_sweep" width="360"/>
 </p>
 
-#### Bspline
+#### Shell
+
+Demo of `Solid::shell`:
 
 ```sh
-cargo run --example 08_bspline
+cargo run --example 08_shell
 ```
 
 ```rust
-use cadrum::Solid;
-use glam::{DQuat, DVec3};
+//! Demo of `Solid::shell`:
+//! - Cube: remove top face, offset inward → open-top container
+//! - Sealed cube: empty open_faces → solid with an internal void (outer skin
+//!   + reversed inner shell)
+//! - Torus: bisect with a half-space to introduce planar cut faces, then
+//!   shell using those cut faces as the openings → thin-walled half-ring
+//!   with both cross-sections exposed
+
+use cadrum::{DVec3, Error, Solid};
+
+fn hollow_cube() -> Result<Solid, Error> {
+	let cube = Solid::cube(8.0, 8.0, 8.0);
+	// TopExp_Explorer order on a box is stable; +Z face ends up last.
+	let top = cube.iter_face().last().expect("cube has faces");
+	cube.shell(-1.0, [top])
+}
+
+fn sealed_cube() -> Result<Solid, Error> {
+	let cube = Solid::cube(8.0, 8.0, 8.0);
+	cube.shell(-1.0, std::iter::empty::<&cadrum::Face>())
+}
+
+fn halved_shelled_torus(thickness: f64) -> Result<Solid, Error> {
+	let torus = Solid::torus(6.0, 2.0, DVec3::Y);
+	// Bisect with Y=0 half-space (normal +Y): keep the +Y half of the ring — always 1 solid.
+	let cutter = Solid::half_space(DVec3::ZERO, -DVec3::Z);
+	// `iter_history()` yields [post_id, src_id] pairs for every result face.
+	// Filter to those whose src_id is one of the cutter's faces, then collect
+	// their post_ids — these are the planar cut faces in the result that we
+	// want to use as shell openings.
+	let cutter_face_ids: std::collections::HashSet<u64> =
+		cutter.iter_face().map(|f| f.id()).collect();
+	let halves = torus.intersect(&[cutter])?;
+	let half = halves.into_iter().next().ok_or(Error::BooleanOperationFailed)?;
+	let from_cutter: std::collections::HashSet<u64> = half
+		.iter_history()
+		.filter_map(|[post, src]| cutter_face_ids.contains(&src).then_some(post))
+		.collect();
+	half.shell(thickness, half.iter_face().filter(|f| from_cutter.contains(&f.id())))
+}
+
+fn main() -> Result<(), Error> {
+	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
+
+	let result = [
+		hollow_cube()?.color("#d0a878"),
+		sealed_cube()?.color("#6fbf73").translate(DVec3::Y * 10.0),
+		halved_shelled_torus(1.0)?.color("#ff5e00").translate(DVec3::X * 18.0),
+		halved_shelled_torus(-1.0)?.color("#0052ff").translate(DVec3::X * 18.0 + DVec3::Y * 10.0),
+	];
+
+	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
+	cadrum::Solid::write_step(&result, &mut f).expect("failed to write STEP");
+
+	// Isometric view from (1, 1, 2) with shading so the cavity depth reads
+	// naturally.
+	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
+	cadrum::Solid::mesh(&result, 0.2).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true, &mut f)).expect("failed to write SVG");
+
+	println!("wrote {example_name}.step / {example_name}.svg");
+	Ok(())
+}
+
+```
+- [08_shell.step](https://lzpel.github.io/cadrum/08_shell.step)
+
+<p align="center">
+  <img src="https://lzpel.github.io/cadrum/08_shell.svg" alt="08_shell" width="360"/>
+</p>
+
+#### Bspline
+
+```sh
+cargo run --example 09_bspline
+```
+
+```rust
+use cadrum::{DQuat, DVec3, Solid};
 use std::f64::consts::TAU;
 
 // 2 field-period stellarator-like torus.
@@ -657,21 +730,156 @@ fn point(i: usize, j: usize) -> DVec3 {
 fn main() {
 	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
 
-	let grid: [[DVec3; N]; M] = std::array::from_fn(|i| std::array::from_fn(|j| point(i, j)));
-	let plasma = Solid::bspline(grid, true).expect("2-period bspline torus should succeed");
+	let plasma = Solid::bspline(M, N, true, point).expect("2-period bspline torus should succeed");
 	let objects = [plasma.color("cyan")];
 	let mut f = std::fs::File::create(format!("{example_name}.step")).unwrap();
-	cadrum::write_step(&objects, &mut f).unwrap();
+	cadrum::Solid::write_step(&objects, &mut f).unwrap();
 	let mut f_svg = std::fs::File::create(format!("{example_name}.svg")).unwrap();
-	cadrum::mesh(&objects, 0.1).and_then(|m| m.write_svg(DVec3::new(0.05, 0.05, 1.0), false, true, &mut f_svg)).unwrap();
-	eprintln!("wrote {0}.step / {0}.svg", example_name);
+	cadrum::Solid::mesh(&objects, 0.1).and_then(|m| m.write_svg(DVec3::new(0.05, 0.05, 1.0), DVec3::Y, false, true, &mut f_svg)).unwrap();
+	println!("wrote {example_name}.step / {example_name}.svg");
 }
 
 ```
-- [08_bspline.step](https://lzpel.github.io/cadrum/08_bspline.step)
+- [09_bspline.step](https://lzpel.github.io/cadrum/09_bspline.step)
 
 <p align="center">
-  <img src="https://lzpel.github.io/cadrum/08_bspline.svg" alt="08_bspline" width="360"/>
+  <img src="https://lzpel.github.io/cadrum/09_bspline.svg" alt="09_bspline" width="360"/>
+</p>
+
+#### Fillet
+
+Demo of `Solid::fillet_edges`:
+
+```sh
+cargo run --example 10_fillet
+```
+
+```rust
+//! Demo of `Solid::fillet_edges`:
+//! - All 12 cube edges filleted uniformly (rounded cube)
+//! - Only top 4 edges filleted (soft top, sharp base)
+//! - Cylinder top circular edge filleted (coin shape)
+
+use cadrum::{DVec3, Error, Solid};
+
+fn rounded_cube(size: f64) -> Result<Solid, Error> {
+	let cube = Solid::cube(size, size, size).translate(-DVec3::ONE * (size / 2.0));
+	let radius = size * 0.2;
+	cube.fillet_edges(radius, cube.iter_edge())
+}
+
+fn soft_top_cube(size: f64) -> Result<Solid, Error> {
+	let cube = Solid::cube(size, size, size).translate(-DVec3::ONE * (size / 2.0));
+	let radius = size * 0.2;
+	// Top cap boundary: a closed circular edge whose start == end lives at z = h.
+	let top_edges = cube
+		.iter_edge()
+		.filter(|e| [e.start_point(), e.end_point()].iter().all(|p| (p.z - size / 2.0).abs() < 1e-6));
+	cube.fillet_edges(radius, top_edges)
+}
+
+fn coin(radius: f64, height: f64) -> Result<Solid, Error> {
+	let cyl = Solid::cylinder(radius, DVec3::Z, height);
+	let radius = height * 0.3;
+	// Top cap boundary: a closed circular edge whose start == end lives at z = h.
+	let top_circle = cyl
+		.iter_edge()
+		.filter(|e| [e.start_point(), e.end_point()].iter().all(|p| (p.z - height).abs() < 1e-6));
+	cyl.fillet_edges(radius, top_circle)
+}
+
+fn main() -> Result<(), Error> {
+	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
+
+	let result = [
+		rounded_cube(8.0)?.color("#d0a878"),
+		soft_top_cube(8.0)?.color("#6fbf73").translate(DVec3::X * 12.0),
+		coin(4.0, 2.0)?.color("#0052ff").translate(DVec3::X * 24.0),
+	];
+
+	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
+	cadrum::Solid::write_step(&result, &mut f).expect("failed to write STEP");
+
+	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
+	cadrum::Solid::mesh(&result, 0.2).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true, &mut f)).expect("failed to write SVG");
+
+	println!("wrote {example_name}.step / {example_name}.svg");
+	Ok(())
+}
+
+```
+- [10_fillet.step](https://lzpel.github.io/cadrum/10_fillet.step)
+
+<p align="center">
+  <img src="https://lzpel.github.io/cadrum/10_fillet.svg" alt="10_fillet" width="360"/>
+</p>
+
+#### Chamfer
+
+Demo of `Solid::chamfer_edges` — mirror of `10_fillet.rs` using bevels:
+
+```sh
+cargo run --example 11_chamfer
+```
+
+```rust
+//! Demo of `Solid::chamfer_edges` — mirror of `10_fillet.rs` using bevels:
+//! - All 12 cube edges chamfered uniformly (beveled cube)
+//! - Only top 4 edges chamfered (soft top, sharp base)
+//! - Cylinder top circular edge chamfered (coin with beveled rim)
+
+use cadrum::{DVec3, Error, Solid};
+
+fn beveled_cube(size: f64) -> Result<Solid, Error> {
+	let cube = Solid::cube(size, size, size).translate(-DVec3::ONE * (size / 2.0));
+	let distance = size * 0.2;
+	cube.chamfer_edges(distance, cube.iter_edge())
+}
+
+fn beveled_top_cube(size: f64) -> Result<Solid, Error> {
+	let cube = Solid::cube(size, size, size).translate(-DVec3::ONE * (size / 2.0));
+	let distance = size * 0.2;
+	// Top cap boundary: a closed circular edge whose start == end lives at z = h.
+	let top_edges = cube
+		.iter_edge()
+		.filter(|e| [e.start_point(), e.end_point()].iter().all(|p| (p.z - size / 2.0).abs() < 1e-6));
+	cube.chamfer_edges(distance, top_edges)
+}
+
+fn beveled_coin(radius: f64, height: f64) -> Result<Solid, Error> {
+	let cyl = Solid::cylinder(radius, DVec3::Z, height);
+	let distance = height * 0.3;
+	// Top cap boundary: a closed circular edge whose start == end lives at z = h.
+	let top_circle = cyl
+		.iter_edge()
+		.filter(|e| [e.start_point(), e.end_point()].iter().all(|p| (p.z - height).abs() < 1e-6));
+	cyl.chamfer_edges(distance, top_circle)
+}
+
+fn main() -> Result<(), Error> {
+	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
+
+	let result = [
+		beveled_cube(8.0)?.color("#d0a878"),
+		beveled_top_cube(8.0)?.color("#6fbf73").translate(DVec3::X * 12.0),
+		beveled_coin(4.0, 2.0)?.color("#0052ff").translate(DVec3::X * 24.0),
+	];
+
+	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
+	cadrum::Solid::write_step(&result, &mut f).expect("failed to write STEP");
+
+	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
+	cadrum::Solid::mesh(&result, 0.2).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true, &mut f)).expect("failed to write SVG");
+
+	println!("wrote {example_name}.step / {example_name}.svg");
+	Ok(())
+}
+
+```
+- [11_chamfer.step](https://lzpel.github.io/cadrum/11_chamfer.step)
+
+<p align="center">
+  <img src="https://lzpel.github.io/cadrum/11_chamfer.svg" alt="11_chamfer" width="360"/>
 </p>
 
 
@@ -693,6 +901,27 @@ fn main() {
 A browser-based configurator that lets you tweak dimensions of a STEP model and get an instant 3D preview and quote. cadrum powers the parametric reshaping and meshing on the backend.
 
 ## Release Notes
+
+### 0.7.2
+
+Aggregated changes since 0.6.0 (no separate entries were written for 0.6.1 – 0.7.1).
+
+- **`Solid::shell(thickness, open_faces)`** — hollow a solid via `BRepOffsetAPI_MakeThickSolid`. Empty `open_faces` produces a sealed internal void (cavity). Example: `examples/08_shell.rs`.
+- **`Solid::fillet_edges(radius, edges)` / `Solid::chamfer_edges(distance, edges)`** — uniform fillet / chamfer on selected edges via `BRepFilletAPI_MakeFillet` / `MakeChamfer`.
+- **`Solid::area()` / `Solid::center()` / `Solid::inertia()`** — surface area, center of mass, inertia tensor. Replaces the previous `shell_count` query.
+- **`Wire::project(point)`** — closest-point + tangent query on `Edge` / `Vec<Edge>` / `[Edge; N]` via `GeomAPI_ProjectPointOnCurve`.
+- **`Edge::end_point()` / `Edge::end_tangent()`** — added as siblings to the existing `start_*` accessors.
+- **`Solid::iter_edge()` / `Solid::iter_face()`** — yield `&Edge` / `&Face` references through internal `OnceLock` caches; first call populates, subsequent calls are free.
+- **`Solid::history` + `Solid::iter_history()`** — face-derivation pairs `[post_id, src_id]` populated by boolean ops and `clean()`. Lets callers select result faces by their original input membership.
+- **Multi-color STEP read recovery (#129).** SolveSpace-style multi-color STEP files (which duplicate `EDGE_CURVE` entities at face boundaries instead of sharing them) used to land as `Compound{Shell×N}` with zero solids, breaking every downstream op. A `BRepBuilderAPI_Sewing` post-process now stitches coincident edges, promotes the result to one valid `Solid`, and remaps the colormap. The same STEP file is currently unfixable in CadQuery — see `sandbox-cadquery/read_step_fillet.py`.
+- **`Mesh::write_svg` / `Mesh::to_svg` gained `up_dir: DVec3`** between `view: DVec3` and `hidden_lines: bool` (#127). **Breaking vs 0.7.0**: pass `DVec3::Z` to reproduce earlier output.
+- **`Transform` trait no longer in the public prelude** (#91) — its methods reach you via `Compound` / `Wire` forwarders, so `use cadrum::{Compound, Wire};` is enough for every transform call. **Breaking vs 0.7.0** for code that imported `Transform` explicitly.
+- **`*_with_metadata` boolean variants removed** (#130) — the same information is now available via `Solid::iter_history()` on the result solid. **Breaking** for callers that consumed the metadata tuple.
+- **glam types re-exported from the crate root** (#94, #95) — downstream code no longer needs its own `glam` dependency for `DVec3` etc.
+- **OCCT `Statistics on Transfer` stdout chatter silenced** on every STEP read / write (#97).
+- **mingw prebuilt is now self-contained** (#89): bundles the container's `libstdc++.a` / `libgcc.a`, so user-built `x86_64-pc-windows-gnu` executables do not depend on MinGW runtime DLLs at link time.
+- **docs.rs build restored** (#107, #111): dropped the unsupported `x86_64-pc-windows-msvc` target and reordered `build.rs` so trait delegation generation runs before the DOCS_RS early-return.
+- New example `08_shell.rs` (hollow torus carved by halfspace-cut openings); old `08_bspline.rs` renumbered to `09_bspline.rs`. Top README image updated to the alphastell stellarator render (#125).
 
 ### 0.6.0
 
