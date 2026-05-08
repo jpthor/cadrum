@@ -1,21 +1,18 @@
+<div align="center">
+
 # cadrum
 
-[![GitHub License](https://img.shields.io/github/license/lzpel/cadrum)](https://github.com/lzpel/cadrum/blob/main/LICENSE)
-[![Crates.io](https://img.shields.io/crates/v/cadrum.svg?logo=rust)](https://crates.io/crates/cadrum)
-[![Docs](https://img.shields.io/badge/docs-lzpel.github.io%2Fcadrum-blue)](https://lzpel.github.io/cadrum)
+Rust CAD library powered by statically linked, headless [OpenCASCADE][occt] (OCCT 8.0.0).
 
-Rust CAD library powered by statically linked, headless [OpenCASCADE](https://dev.opencascade.org/) (OCCT 8.0.0-rc5).
+[![GitHub License][license_img]][license_link]
+[![Crates.io][crate_img]][crate_link]
+[![docs.rs][docsrs_img]][docsrs_link]
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/lzpel/alphastell/main/figure/image.png" alt="cadrum"/>
-</p>
-<!--
-<p align="center">
-  <img src="figure/chijin.svg" alt="chijin — a drum of Amami Oshima" width="360"/>
-</p>
--->
+<img src="https://raw.githubusercontent.com/lzpel/alphastell/main/figure/image.png" alt="cadrum"/>
 
-## Usage
+</div>
+
+<!--GALLERY-->
 
 | [primitives](#primitives) | [write read](#write-read) | [transform](#transform) | [boolean](#boolean) |
 |:---:|:---:|:---:|:---:|
@@ -25,7 +22,63 @@ Rust CAD library powered by statically linked, headless [OpenCASCADE](https://de
 | [bspline](#bspline) | [fillet](#fillet) | [chamfer](#chamfer) |  |
 | [<img src="https://lzpel.github.io/cadrum/09_bspline.svg" width="180" alt="bspline"/>](#bspline) | [<img src="https://lzpel.github.io/cadrum/10_fillet.svg" width="180" alt="fillet"/>](#fillet) | [<img src="https://lzpel.github.io/cadrum/11_chamfer.svg" width="180" alt="chamfer"/>](#chamfer) |  |
 
-More examples with source code are available at [lzpel.github.io/cadrum](https://lzpel.github.io/cadrum).
+
+## Summary
+
+Other Rust CAD bindings either require the user to install OCCT ahead of time
+(with all the version skew this entails on Linux distros and Windows) or
+expose OCCT's class hierarchy 1:1, where building a cube ends up touching
+`gp_Pnt`, `gp_Ax2`, `BRepPrimAPI_MakeBox`, and `TopoDS_Shape` before any
+geometry actually appears.
+
+`cadrum` takes a different bet:
+
+- **Static linking with prebuilt binaries.** `cargo build` on a supported
+  target downloads a self-contained OCCT 8.0.0 tarball and links it
+  statically. No system OCCT, no dynamic libraries to ship, no
+  `LD_LIBRARY_PATH` in production.
+- **A minimal type surface.** Three concrete shape types — `Solid`, `Edge`,
+  `Face` — plus a triangle `Mesh` for visual output and `glam` vectors for
+  input. Operations are inherent methods on the shape types, so
+  `Solid::cube(...).rotate_z(0.5).translate(DVec3::X * 10.0)` chains like
+  any value-returning Rust API.
+- **Collections are first-class.** `Vec<Solid>` and `[Solid; N]` carry the
+  same transform, query, and boolean methods as a single `Solid` via the
+  `Compound` trait; the wire / edge-list pair has the parallel `Wire`
+  trait.
+
+## Introduction
+
+OpenCASCADE represents shapes as a *boundary representation* (BRep): a solid
+is a topological assembly of faces, faces are trimmed surfaces bounded by
+edges, edges are 3D curves with a parameter range. Booleans, fillets,
+sweeps, and the like rebuild this assembly under the hood; CAD I/O formats
+like STEP / IGES preserve it exactly across applications.
+
+Working at that level pays off when the application needs to reason about
+geometry — closest-point queries, swept profiles along arbitrary spines,
+history-tracked face derivation through booleans — and not merely render
+triangles. Triangle meshes are a separate, lossy projection that `cadrum`
+exposes through `Solid::mesh` when an STL export or SVG render is required.
+
+## Capabilities
+
+| Area | Methods |
+|---|---|
+| **Primitives** | `Solid::cube`, `Solid::sphere`, `Solid::cylinder`, `Solid::cone`, `Solid::torus`, `Solid::half_space` |
+| **Curves** | `Edge::line`, `Edge::arc_3pts`, `Edge::circle`, `Edge::polygon`, `Edge::helix`, `Edge::bspline` |
+| **Surfacing** | `Solid::extrude`, `Solid::sweep`, `Solid::loft`, `Solid::bspline` |
+| **Editing** | `Solid::shell`, `Solid::fillet_edges`, `Solid::chamfer_edges`, `Solid::clean` |
+| **Booleans** | `Solid::union`, `Solid::subtract`, `Solid::intersect` |
+| **Transforms** *(shared by `Solid` / `Edge` / `Compound` / `Wire`)* | `translate`, `rotate`, `rotate_x` / `_y` / `_z`, `scale`, `mirror`, `align_x` / `_y` / `_z` |
+| **Queries** | `Solid::volume`, `Solid::area`, `Solid::center`, `Solid::inertia`, `Solid::bounding_box`, `Solid::contains` |
+| **Topology** | `Solid::iter_face`, `Solid::iter_edge`, `Face::iter_edge`, `Face::project`, `Edge::project` |
+| **Identity / history** | `Solid::id`, `Face::id`, `Edge::id`, `Solid::iter_history` |
+| **I/O** | `Solid::read_step` / `Solid::write_step`, `Solid::read_brep_binary` / `Solid::write_brep_binary`, `Solid::read_brep_text` / `Solid::write_brep_text` |
+| **Mesh** | `Solid::mesh` → `Mesh`, `Mesh::write_stl`, `Mesh::write_svg` |
+| **Color** *(feature `color`)* | per-face color preserved across STEP / BRep / STL / SVG round-trips |
+
+## Build
 
 Add this to your `Cargo.toml`:
 
@@ -34,9 +87,7 @@ Add this to your `Cargo.toml`:
 cadrum = "^0.7"
 ```
 
-## Build
-
-`cargo build` automatically downloads a prebuilt OCCT 8.0.0-rc5 binary for the targets below.
+`cargo build` automatically downloads a prebuilt OCCT 8.0.0 binary for the targets below.
 
 | | Target | Prebuilt |
 |--|--------|----------|
@@ -47,7 +98,9 @@ cadrum = "^0.7"
 
 For other targets, build OCCT from source:
 
-    OCCT_ROOT=/path/to/occt cargo build --features source-build
+```sh
+OCCT_ROOT=/path/to/occt cargo build --features source-build
+```
 
 If `OCCT_ROOT` is not set, built binaries are cached under `target/`.
 
@@ -66,7 +119,7 @@ Primitive solids: box, cylinder, sphere, cone, torus — colored and exported as
 cargo run --example 01_primitives
 ```
 
-```rust
+```rust,no_run
 //! Primitive solids: box, cylinder, sphere, cone, torus — colored and exported as STEP + SVG.
 
 use cadrum::{DVec3, Solid};
@@ -113,7 +166,7 @@ Read and write: chain STEP, BRep text, and BRep binary round-trips with progress
 cargo run --example 02_write_read
 ```
 
-```rust
+```rust,no_run
 //! Read and write: chain STEP, BRep text, and BRep binary round-trips with progressive rotation.
 
 use cadrum::{Compound, DVec3, Solid};
@@ -188,7 +241,7 @@ Transform operations: translate, rotate, scale, and mirror applied to a cone.
 cargo run --example 03_transform
 ```
 
-```rust
+```rust,no_run
 //! Transform operations: translate, rotate, scale, and mirror applied to a cone.
 
 use cadrum::{DVec3, Solid};
@@ -246,7 +299,7 @@ Boolean operations: union, subtract, and intersect between a box and a cylinder.
 cargo run --example 04_boolean
 ```
 
-```rust
+```rust,no_run
 //! Boolean operations: union, subtract, and intersect between a box and a cylinder.
 
 use cadrum::{Compound, DVec3, Solid};
@@ -300,7 +353,7 @@ Demo of `Solid::extrude`: push a closed 2D profile along a direction vector.
 cargo run --example 05_extrude
 ```
 
-```rust
+```rust,no_run
 //! Demo of `Solid::extrude`: push a closed 2D profile along a direction vector.
 //!
 //! - **Box**: square polygon extruded along Z
@@ -393,7 +446,7 @@ Demo of `Solid::loft`: skin a smooth solid through cross-section wires.
 cargo run --example 06_loft
 ```
 
-```rust
+```rust,no_run
 //! Demo of `Solid::loft`: skin a smooth solid through cross-section wires.
 //!
 //! - **Frustum**: two circles of different radii → truncated cone (minimal loft)
@@ -444,10 +497,10 @@ fn main() -> Result<(), Error> {
 	let result = [frustum, morph, tilted];
 
 	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
-	cadrum::Solid::write_step(&result, &mut f).expect("failed to write STEP");
+	Solid::write_step(&result, &mut f).expect("failed to write STEP");
 
 	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
-	cadrum::Solid::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::ONE, DVec3::Z, true, false, &mut f)).expect("failed to write SVG");
+	Solid::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::ONE, DVec3::Z, true, false, &mut f)).expect("failed to write SVG");
 
 	println!("wrote {example_name}.step / {example_name}.svg");
 	Ok(())
@@ -468,7 +521,7 @@ Sweep showcase: M2 screw (helix spine) + U-shaped pipe (line+arc+line spine)
 cargo run --example 07_sweep
 ```
 
-```rust
+```rust,no_run
 //! Sweep showcase: M2 screw (helix spine) + U-shaped pipe (line+arc+line spine)
 //! + twisted ribbon (`Auxiliary` aux-spine mode).
 //!
@@ -591,10 +644,10 @@ fn main() -> Result<(), Error> {
 	let all: Vec<Solid> = [build_m2_screw()?, build_u_pipe()?, build_twisted_ribbon()?].concat();
 
 	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
-	cadrum::Solid::write_step(&all, &mut f)?;
+	Solid::write_step(&all, &mut f)?;
 	let mut f_svg = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
 	// Helical threads have dense hidden lines that clutter the SVG; disable them.
-	cadrum::Solid::mesh(&all, 0.5)?.write_svg(DVec3::new(1.0, 1.0, -1.0), DVec3::Z, false, false, &mut f_svg)?;
+	Solid::mesh(&all, 0.5)?.write_svg(DVec3::new(1.0, 1.0, -1.0), DVec3::Z, false, false, &mut f_svg)?;
 	println!("wrote {example_name}.step / {example_name}.svg ({} solids)", all.len());
 	Ok(())
 }
@@ -614,7 +667,7 @@ Demo of `Solid::shell`:
 cargo run --example 08_shell
 ```
 
-```rust
+```rust,no_run
 //! Demo of `Solid::shell`:
 //! - Cube: remove top face, offset inward → open-top container
 //! - Sealed cube: empty open_faces → solid with an internal void (outer skin
@@ -667,12 +720,12 @@ fn main() -> Result<(), Error> {
 	];
 
 	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
-	cadrum::Solid::write_step(&result, &mut f).expect("failed to write STEP");
+	Solid::write_step(&result, &mut f).expect("failed to write STEP");
 
 	// Isometric view from (1, 1, 2) with shading so the cavity depth reads
 	// naturally.
 	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
-	cadrum::Solid::mesh(&result, 0.2).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true, &mut f)).expect("failed to write SVG");
+	Solid::mesh(&result, 0.2).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true, &mut f)).expect("failed to write SVG");
 
 	println!("wrote {example_name}.step / {example_name}.svg");
 	Ok(())
@@ -691,7 +744,7 @@ fn main() -> Result<(), Error> {
 cargo run --example 09_bspline
 ```
 
-```rust
+```rust,no_run
 use cadrum::{DQuat, DVec3, Solid};
 use std::f64::consts::TAU;
 
@@ -733,9 +786,9 @@ fn main() {
 	let plasma = Solid::bspline(M, N, true, point).expect("2-period bspline torus should succeed");
 	let objects = [plasma.color("cyan")];
 	let mut f = std::fs::File::create(format!("{example_name}.step")).unwrap();
-	cadrum::Solid::write_step(&objects, &mut f).unwrap();
+	Solid::write_step(&objects, &mut f).unwrap();
 	let mut f_svg = std::fs::File::create(format!("{example_name}.svg")).unwrap();
-	cadrum::Solid::mesh(&objects, 0.1).and_then(|m| m.write_svg(DVec3::new(0.05, 0.05, 1.0), DVec3::Y, false, true, &mut f_svg)).unwrap();
+	Solid::mesh(&objects, 0.1).and_then(|m| m.write_svg(DVec3::new(0.05, 0.05, 1.0), DVec3::Y, false, true, &mut f_svg)).unwrap();
 	println!("wrote {example_name}.step / {example_name}.svg");
 }
 
@@ -754,7 +807,7 @@ Demo of `Solid::fillet_edges`:
 cargo run --example 10_fillet
 ```
 
-```rust
+```rust,no_run
 //! Demo of `Solid::fillet_edges`:
 //! - All 12 cube edges filleted uniformly (rounded cube)
 //! - Only top 4 edges filleted (soft top, sharp base)
@@ -798,10 +851,10 @@ fn main() -> Result<(), Error> {
 	];
 
 	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
-	cadrum::Solid::write_step(&result, &mut f).expect("failed to write STEP");
+	Solid::write_step(&result, &mut f).expect("failed to write STEP");
 
 	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
-	cadrum::Solid::mesh(&result, 0.2).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true, &mut f)).expect("failed to write SVG");
+	Solid::mesh(&result, 0.2).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true, &mut f)).expect("failed to write SVG");
 
 	println!("wrote {example_name}.step / {example_name}.svg");
 	Ok(())
@@ -822,7 +875,7 @@ Demo of `Solid::chamfer_edges` — mirror of `10_fillet.rs` using bevels:
 cargo run --example 11_chamfer
 ```
 
-```rust
+```rust,no_run
 //! Demo of `Solid::chamfer_edges` — mirror of `10_fillet.rs` using bevels:
 //! - All 12 cube edges chamfered uniformly (beveled cube)
 //! - Only top 4 edges chamfered (soft top, sharp base)
@@ -866,10 +919,10 @@ fn main() -> Result<(), Error> {
 	];
 
 	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
-	cadrum::Solid::write_step(&result, &mut f).expect("failed to write STEP");
+	Solid::write_step(&result, &mut f).expect("failed to write STEP");
 
 	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
-	cadrum::Solid::mesh(&result, 0.2).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true, &mut f)).expect("failed to write SVG");
+	Solid::mesh(&result, 0.2).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true, &mut f)).expect("failed to write SVG");
 
 	println!("wrote {example_name}.step / {example_name}.svg");
 	Ok(())
@@ -883,74 +936,220 @@ fn main() -> Result<(), Error> {
 </p>
 
 
+## The Type Map
+
+Three concrete shape types and two trait umbrellas form the whole public
+surface:
+
+```text
+    Edge  ── single 3D curve         ┐
+    Face  ── trimmed 3D surface      │ concrete BRep handles
+    Solid ── connected closed body   ┘
+
+    Wire     ── trait carrying methods on Edge / Vec<Edge> / [Edge; N]
+    Compound ── trait carrying methods on Solid / Vec<Solid> / [Solid; N]
+```
+
+On a single `Solid` or single `Edge`, every method is reachable inherently —
+no trait import needed:
+
+```rust,no_run
+# use cadrum::{DVec3, Solid};
+let s = Solid::cube(1.0, 1.0, 1.0).rotate_z(0.5).translate(DVec3::X);
+let v = s.volume();
+```
+
+On a `Vec<Solid>` or `[Solid; N]`, the same operations live behind the
+`Compound` trait. A single `use cadrum::Compound;` brings them into scope
+on the collection — including the spatial transforms, which on collections
+distribute element-wise:
+
+```rust,no_run
+use cadrum::{Compound, DVec3, Solid};
+
+let parts: Vec<Solid> = vec![
+    Solid::cube(1.0, 1.0, 1.0),
+    Solid::sphere(1.0),
+];
+let shifted = parts.translate(DVec3::X * 5.0);
+let total   = shifted.volume();        // Σ per-element volumes
+let bbox    = shifted.bounding_box();  // union AABB
+```
+
+`Vec<Edge>` plays the equivalent role for wires (open or closed polylines
+made of edges) under `Wire`. There is no separate `Wire` type — an ordered
+`Vec<Edge>` *is* a wire, and sweep / loft / extrude all take any
+`IntoIterator<Item = &Edge>`.
+
+### Spatial transforms across the whole hierarchy
+
+The transform family — `translate`, `rotate`, `rotate_x` / `_y` / `_z`,
+`scale`, `mirror`, `align_x` / `_y` / `_z` — is implemented identically on
+every shape and every collection. The same method name and signature works
+on:
+
+- a single `Solid` — `cube.rotate_z(angle)`
+- a single `Edge` — `circle.translate(offset)`
+- `Vec<Solid>` / `[Solid; N]` via `Compound` — element-wise
+- `Vec<Edge>` / `[Edge; N]` via `Wire` — element-wise
+
+```rust,no_run
+use cadrum::{Compound, DVec3, Edge, Solid, Wire};
+use std::f64::consts::FRAC_PI_4;
+
+let s: Solid          = Solid::sphere(1.0).translate(DVec3::X);
+let e: Edge           = Edge::circle(1.0, DVec3::Z)?.rotate_x(FRAC_PI_4);
+let v_s: Vec<Solid>   = vec![Solid::cube(1.0, 1.0, 1.0)].translate(DVec3::Y);
+let v_e: Vec<Edge>    = Edge::polygon(&[
+    DVec3::ZERO, DVec3::X, DVec3::X + DVec3::Y, DVec3::Y,
+])?.rotate_z(FRAC_PI_4);
+# Ok::<(), cadrum::Error>(())
+```
+
+On `Solid` / `Edge` themselves the methods are inherent (no import
+required); on collections `use cadrum::Compound;` / `use cadrum::Wire;`
+brings them into scope.
+
+## Working with Wires
+
+Wire constructors return either a single `Edge` or `Vec<Edge>` depending on
+what is natural for the curve:
+
+```rust,no_run
+use cadrum::{BSplineEnd, DVec3, Edge};
+
+// Single-edge primitives → Edge
+let line   = Edge::line(DVec3::ZERO, DVec3::X)?;
+let arc    = Edge::arc_3pts(DVec3::ZERO, DVec3::X, DVec3::Y)?;
+let circle = Edge::circle(1.0, DVec3::Z)?;
+let helix  = Edge::helix(1.0, 0.4, 6.0, DVec3::Z, DVec3::X)?;
+
+// Multi-edge primitive → Vec<Edge>
+let square = Edge::polygon(&[
+    DVec3::new(0.0, 0.0, 0.0),
+    DVec3::new(1.0, 0.0, 0.0),
+    DVec3::new(1.0, 1.0, 0.0),
+    DVec3::new(0.0, 1.0, 0.0),
+])?;
+
+// Free-form curve → Edge (single B-spline)
+let curve = Edge::bspline(
+    &[DVec3::ZERO, DVec3::X, DVec3::X + DVec3::Y, DVec3::Y],
+    BSplineEnd::NotAKnot,
+)?;
+# Ok::<(), cadrum::Error>(())
+```
+
+Either shape feeds `Solid::extrude`, `Solid::sweep`, or `Solid::loft`
+uniformly because they take `IntoIterator<Item = &Edge>`:
+
+```rust,no_run
+# use cadrum::{DVec3, Edge, Solid};
+# let circle = Edge::circle(1.0, DVec3::Z)?;
+# let square: Vec<Edge> = vec![];
+let s1 = Solid::extrude(&[circle], DVec3::Z * 5.0)?;
+let s2 = Solid::extrude(&square,   DVec3::Z * 5.0)?;
+# Ok::<(), cadrum::Error>(())
+```
+
+Pass a single edge as `&[edge]` rather than relying on a sugar that lets
+`&edge` adapt — the slice form keeps the "this function consumes a
+collection" intent visible at the call site.
+
+## Booleans and Topology History
+
+Boolean operations return `Vec<Solid>` because a subtraction or
+intersection can split into several disjoint pieces. Each result solid
+carries a `Solid::iter_history` log of `[post_id, src_id]` pairs — every
+face in the result remembers which face of which input it came from. That
+makes face selectors stable across boolean stages:
+
+```rust,no_run
+use cadrum::{Compound, DVec3, Solid};
+
+let block = Solid::cube(20.0, 20.0, 20.0);
+let hole  = Solid::cylinder(8.0, DVec3::Z, 30.0)
+    .translate(DVec3::new(10.0, 10.0, -5.0));
+
+let drilled = block.subtract(&[hole])?;
+let from_block: Vec<u64> = drilled[0]
+    .iter_history()
+    .filter(|[_, src]| *src == block.id())   // faces inherited from `block`
+    .map(|[post, _]| post)
+    .collect();
+# Ok::<(), cadrum::Error>(())
+```
+
+See `examples/08_shell.rs` for a worked end-to-end use of this mechanism
+(shelling a torus through cut faces produced by a half-space subtraction).
+
+## Mesh and Visual Output
+
+`Solid::mesh` flattens any number of solids into a single triangle `Mesh`
+using OCCT's BRep mesher (`BRepMesh_IncrementalMesh`). From a `Mesh`,
+`Mesh::write_stl` emits a standard binary STL and `Mesh::write_svg`
+renders a hidden-line-removed 2D projection — handy for documentation and
+quick visual diffs:
+
+```rust,no_run
+use cadrum::{DVec3, Solid};
+
+let parts = [Solid::cube(10.0, 20.0, 30.0)];
+let mesh  = Solid::mesh(&parts, 0.5)?;
+
+mesh.write_stl(&mut std::fs::File::create("out.stl").unwrap())?;
+mesh.write_svg(
+    DVec3::ONE,   // view direction
+    DVec3::Z,     // up direction
+    true,         // include hidden lines (dashed)
+    false,        // Lambertian shading off
+    &mut std::fs::File::create("out.svg").unwrap(),
+)?;
+# Ok::<(), cadrum::Error>(())
+```
+
+## Errors
+
+Every fallible operation returns `Result<T, Error>` with `Error`
+enumerating the failure modes (`Error::SweepFailed`,
+`Error::FilletFailed`, `Error::InvalidEdge`, etc.). Variants that need
+detail carry a `String` payload identifying which constructor or parameter
+combination tripped OCCT, so panics are reserved for true logic bugs.
+
 ## Features
 
-- `color` (default): Colored STEP I/O via XDE. Enables `write_step_with_colors`,
-  `read_step_with_colors`, and per-face color on `Solid`.
-- `source-build`: Download and build OCCT from upstream sources via CMake.
-  Enable this on triples without a published prebuilt.
+- **`color`** *(default)*: Enables `Solid::color` and per-face colormap
+  propagation through STEP / BRep / STL / SVG I/O via OCCT's XDE document
+  model. Disable for a smaller binary if shape color is irrelevant.
+- **`source-build`**: When the prebuilt-binary cache is empty, fall back
+  to building OCCT from upstream sources via CMake instead of failing.
+  Required on targets without a published prebuilt (anything outside the
+  four-way Linux / Windows × x86_64 / aarch64 table). Pulls `cmake` in as
+  a build-dep.
 
 ## Showcase
 
 [Try it now →](https://katachiform.com/out/21)
 
-<p align="center">
-  <a href="https://katachiform.com/out/21"><img src="figure/katachiform.png" alt="cadrum showcase" width="360"/></a>
-</p>
-
 A browser-based configurator that lets you tweak dimensions of a STEP model and get an instant 3D preview and quote. cadrum powers the parametric reshaping and meshing on the backend.
-
-## Release Notes
-
-### 0.7.2
-
-Aggregated changes since 0.6.0 (no separate entries were written for 0.6.1 – 0.7.1).
-
-- **`Solid::shell(thickness, open_faces)`** — hollow a solid via `BRepOffsetAPI_MakeThickSolid`. Empty `open_faces` produces a sealed internal void (cavity). Example: `examples/08_shell.rs`.
-- **`Solid::fillet_edges(radius, edges)` / `Solid::chamfer_edges(distance, edges)`** — uniform fillet / chamfer on selected edges via `BRepFilletAPI_MakeFillet` / `MakeChamfer`.
-- **`Solid::area()` / `Solid::center()` / `Solid::inertia()`** — surface area, center of mass, inertia tensor. Replaces the previous `shell_count` query.
-- **`Wire::project(point)`** — closest-point + tangent query on `Edge` / `Vec<Edge>` / `[Edge; N]` via `GeomAPI_ProjectPointOnCurve`.
-- **`Edge::end_point()` / `Edge::end_tangent()`** — added as siblings to the existing `start_*` accessors.
-- **`Solid::iter_edge()` / `Solid::iter_face()`** — yield `&Edge` / `&Face` references through internal `OnceLock` caches; first call populates, subsequent calls are free.
-- **`Solid::history` + `Solid::iter_history()`** — face-derivation pairs `[post_id, src_id]` populated by boolean ops and `clean()`. Lets callers select result faces by their original input membership.
-- **Multi-color STEP read recovery (#129).** SolveSpace-style multi-color STEP files (which duplicate `EDGE_CURVE` entities at face boundaries instead of sharing them) used to land as `Compound{Shell×N}` with zero solids, breaking every downstream op. A `BRepBuilderAPI_Sewing` post-process now stitches coincident edges, promotes the result to one valid `Solid`, and remaps the colormap. The same STEP file is currently unfixable in CadQuery — see `sandbox-cadquery/read_step_fillet.py`.
-- **`Mesh::write_svg` / `Mesh::to_svg` gained `up_dir: DVec3`** between `view: DVec3` and `hidden_lines: bool` (#127). **Breaking vs 0.7.0**: pass `DVec3::Z` to reproduce earlier output.
-- **`Transform` trait no longer in the public prelude** (#91) — its methods reach you via `Compound` / `Wire` forwarders, so `use cadrum::{Compound, Wire};` is enough for every transform call. **Breaking vs 0.7.0** for code that imported `Transform` explicitly.
-- **`*_with_metadata` boolean variants removed** (#130) — the same information is now available via `Solid::iter_history()` on the result solid. **Breaking** for callers that consumed the metadata tuple.
-- **glam types re-exported from the crate root** (#94, #95) — downstream code no longer needs its own `glam` dependency for `DVec3` etc.
-- **OCCT `Statistics on Transfer` stdout chatter silenced** on every STEP read / write (#97).
-- **mingw prebuilt is now self-contained** (#89): bundles the container's `libstdc++.a` / `libgcc.a`, so user-built `x86_64-pc-windows-gnu` executables do not depend on MinGW runtime DLLs at link time.
-- **docs.rs build restored** (#107, #111): dropped the unsupported `x86_64-pc-windows-msvc` target and reordered `build.rs` so trait delegation generation runs before the DOCS_RS early-return.
-- New example `08_shell.rs` (hollow torus carved by halfspace-cut openings); old `08_bspline.rs` renumbered to `09_bspline.rs`. Top README image updated to the alphastell stellarator render (#125).
-
-### 0.6.0
-
-- **`source-build` feature now gates `cmake`/`walkdir` as optional build-dependencies.** Default `cargo build` no longer compiles them, significantly reducing build time on prebuilt targets. Users on unsupported targets must enable `--features source-build` (behavior unchanged — previously these targets also failed, just with a download error instead of a clear message).
-- **`x86_64-pc-windows-gnu` prebuilt added** via Docker cross-compilation with Debian mingw-w64 (posix thread model). All MinGW runtime DLLs are statically absorbed — the resulting exe depends only on Windows OS DLLs.
-- **LGPL 2.1 §2 compliance:** source builds now retain only the ~9 patched OCCT source files alongside the `.a` libraries, removing the unmodified bulk (~88 MB of data/dox/tests). The patched files carry timestamped headers per §2(a).
-- **`OCCT_ROOT` relative path handling fixed:** resolved via `env::current_dir()` instead of the unreliable `CARGO_TARGET_DIR` heuristic. `--target <triple>` flag now works correctly.
-- **`build.rs` restructured:** `resolve_occt` uses match chains with `#[cfg]` for source-build vs prebuilt paths. Source-build code lives in `#[cfg(feature = "source-build")] mod source`. `patch_occt_sources` split into `walk_occt_sources` + `patch_or_none` (side-effect-free).
-- **README simplified:** Build section moved after Usage with a prebuilt target table + OS icons.
-
-### 0.5.1
-
-> 0.4.5 was published briefly but its version number was lower than the
-> already-published 0.5.0 (OCCT 7.9.3, older feature set), so `cargo add
-> cadrum` would silently pick up 0.5.0 instead of the newer 0.4.5 code.
-> Re-released as 0.5.1 with identical contents. Prefer 0.5.1 over 0.4.5.
-
-- **`Solid::bspline<const M, const N>(grid, periodic)`** — new constructor: build a periodic B-spline solid from a 2D control-point grid. V (cross-section) is always periodic; U (longitudinal) is controlled by the `periodic` flag (torus when `true`, capped pipe when `false`). Implemented via `GeomAPI_PointsToBSplineSurface::Interpolate` over an augmented grid plus `SetUPeriodic`/`SetVPeriodic`.
-- **`write_svg` / `Mesh::to_svg` now take `shading: bool`** — opt-in Lambertian shading with head-on light. When `true`, triangles are tinted by `0.5 + 0.5 * (normal · dir)` so curved/organic shapes read clearly; `false` reproduces the pre-0.5.1 flat rendering. **Breaking vs 0.5.0**: existing callers must add the flag (pass `false` to preserve earlier output).
-- **`examples/08_bspline.rs`** rewritten: 2 field-period stellarator-like torus with twisted + vertically undulating elliptic cross-sections, exercising `Solid::bspline` and `shading=true`.
-- **`tests/bspline.rs`** added: verifies 180° point symmetry of the stellarator shape via XZ/YZ half-space intersection (s1 ≈ s3, s2 ≈ s4).
-- **`Error::BsplineFailed(String)`** new variant. **Breaking** for downstream code that does exhaustive `match` on `Error`.
-- OCCT 8.0.0 deprecation warnings resolved in `make_bspline_edge` and `make_bspline_solid` (`NCollection_HArray1<gp_Pnt>` via local `using` alias to bypass the `Handle()` macro comma-splitting issue; `NCollection_Array2<gp_Pnt>` directly).
 
 ## License
 
 This project is licensed under the MIT License.
 
-Compiled binaries include [OpenCASCADE Technology](https://dev.opencascade.org/) (OCCT),
-which is licensed under the [LGPL 2.1](https://dev.opencascade.org/resources/licensing).
+Compiled binaries include [OpenCASCADE Technology][occt] (OCCT),
+which is licensed under the [LGPL 2.1][occt-license].
 Users who distribute applications built with cadrum must comply with the LGPL 2.1 terms.
 Since cadrum builds OCCT from source, end users can rebuild and relink OCCT to satisfy this requirement.
+
+<!-- Badges -->
+[license_img]: https://img.shields.io/github/license/lzpel/cadrum
+[license_link]: https://github.com/lzpel/cadrum/blob/main/LICENSE
+[crate_img]: https://img.shields.io/crates/v/cadrum.svg?logo=rust
+[crate_link]: https://crates.io/crates/cadrum
+[docsrs_img]: https://img.shields.io/docsrs/cadrum?logo=docsdotrs&label=docs.rs
+[docsrs_link]: https://docs.rs/cadrum
+
+<!-- External References -->
+[occt]: https://dev.opencascade.org/
+[occt-license]: https://dev.opencascade.org/resources/licensing
