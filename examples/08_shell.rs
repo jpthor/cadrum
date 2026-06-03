@@ -30,8 +30,7 @@ fn halved_shelled_torus(thickness: f64) -> Result<Solid, Error> {
 	// want to use as shell openings.
 	let cutter_face_ids: std::collections::HashSet<u64> =
 		cutter.iter_face().map(|f| f.id()).collect();
-	let halves = torus.intersect(&[cutter])?;
-	let half = halves.into_iter().next().ok_or(Error::BooleanOperationFailed)?;
+	let half: Solid = (&torus * &cutter).build()?;
 	let from_cutter: std::collections::HashSet<u64> = half
 		.iter_history()
 		.filter_map(|[post, src]| cutter_face_ids.contains(&src).then_some(post))
@@ -49,14 +48,14 @@ fn main() -> Result<(), Error> {
 		halved_shelled_torus(-1.0)?.color("#0052ff").translate(DVec3::X * 18.0 + DVec3::Y * 10.0),
 	];
 
-	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
-	Solid::write_step(&result, &mut f).expect("failed to write STEP");
+	Solid::write_step(&result, &mut std::fs::File::create(format!("{example_name}.step")).unwrap())?;
 
 	// Isometric view from (1, 1, 2) with shading so the cavity depth reads
 	// naturally.
-	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
-	Solid::mesh(&result, 0.2).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true, &mut f)).expect("failed to write SVG");
+	let scene = Solid::mesh(&result, 0.2)?.scene(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, true);
+	scene.write_svg(&mut std::fs::File::create(format!("{example_name}.svg")).unwrap())?;
+	scene.write_png([640, 640], &mut std::fs::File::create(format!("{example_name}.png")).unwrap())?;
 
-	println!("wrote {example_name}.step / {example_name}.svg");
+	println!("wrote {example_name}.step / {example_name}.svg / {example_name}.png");
 	Ok(())
 }

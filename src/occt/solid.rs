@@ -2,8 +2,9 @@ use super::compound::CompoundShape;
 use super::edge::Edge;
 use super::face::Face;
 use super::ffi;
+use crate::common::boolean::Boolean;
 use crate::common::error::Error;
-use crate::traits::{Compound, ProfileOrient, SolidStruct, Transform};
+use crate::traits::{ProfileOrient, SolidStruct, Transform};
 use glam::DVec3;
 use std::sync::{Mutex, OnceLock};
 
@@ -434,18 +435,58 @@ impl SolidStruct for Solid {
 		Ok(Solid::new(inner, #[cfg(feature = "color")] colormap, history))
 	}
 
-	// ==================== Boolean primitives ====================
+	// ==================== Boolean primitive ====================
 
-	fn boolean_union<'a, 'b>(a: impl IntoIterator<Item = &'a Self>, b: impl IntoIterator<Item = &'b Self>) -> Result<Vec<Self>, Error> where Self: 'a + 'b {
-		Self::boolean_union_impl(a, b)
+	fn boolean<'a>(solids: impl IntoIterator<Item = &'a Self>, clauses: impl IntoIterator<Item = i64>) -> Boolean<Self> where Self: 'a {
+		// TShape* を共有する shallow copy で Boolean を組む。Solid::clone() (=
+		// BRepBuilderAPI_Copy) と違い、各 face の id() が元と一致するため
+		// boolean 結果の history (post_id, src_id) を呼び出し側の face id と
+		// 照合できる。
+		let solids: Vec<Solid> = solids.into_iter().map(|s| Solid {
+			inner: ffi::clone_shape_handle(&s.inner),
+			edges: OnceLock::new(),
+			faces: OnceLock::new(),
+			#[cfg(feature = "color")] colormap: s.colormap.clone(),
+			history: s.history.clone(),
+		}).collect();
+		Boolean::from_parts(solids, clauses.into_iter().collect())
 	}
+	fn boolean_build(b: &Boolean<Self>) -> Result<Vec<Self>, Error> {
+		// CellsBuilder ベースの一括評価。DIMACS-flat DNF (`clauses`) を C++ 側に渡す。
+		let (solids, clauses) = (b.solids(), b.clauses());
+		if solids.is_empty() || clauses.is_empty() {
+			return Err(Error::OneFailed(0));
+		}
+		debug_assert!(clauses.last() == Some(&0), "clauses must be 0-terminated");
 
-	fn boolean_subtract<'a, 'b>(a: impl IntoIterator<Item = &'a Self>, b: impl IntoIterator<Item = &'b Self>) -> Result<Vec<Self>, Error> where Self: 'a + 'b {
-		Self::boolean_subtract_impl(a, b)
-	}
+		let mut solid_vec = ffi::shape_vec_new();
+		for s in solids {
+			ffi::shape_vec_push(solid_vec.pin_mut(), s.inner());
+		}
+		let mut history: Vec<u64> = Default::default();
+		let inner = ffi::builder_cells(&solid_vec, clauses, &mut history);
+		if inner.is_null() { return Err(Error::BooleanOperationFailed); }
 
-	fn boolean_intersect<'a, 'b>(a: impl IntoIterator<Item = &'a Self>, b: impl IntoIterator<Item = &'b Self>) -> Result<Vec<Self>, Error> where Self: 'a + 'b {
-		Self::boolean_intersect_impl(a, b)
+		#[cfg(feature = "color")]
+		let colormap = {
+			let mut m = std::collections::HashMap::new();
+			for pair in history.chunks_exact(2) {
+				for s in solids {
+					if let Some(&c) = s.colormap.get(&pair[1]) {
+						m.entry(pair[0]).or_insert(c);
+						break;
+					}
+				}
+			}
+			m
+		};
+
+		let compound = CompoundShape::from_raw(
+			inner,
+			#[cfg(feature = "color")] colormap,
+			history,
+		);
+		Ok(compound.decompose())
 	}
 
 	// --- I/O (delegates to super::io helpers) ---
@@ -476,6 +517,64 @@ impl SolidStruct for Solid {
 
 	fn mesh<'a>(solids: impl IntoIterator<Item = &'a Self>, tolerance: f64) -> Result<crate::common::mesh::Mesh, Error> where Self: 'a {
 		super::io::mesh(solids, tolerance)
+	}
+
+	// ==================== Queries ====================
+
+	fn volume(&self) -> f64 {
+		ffi::shape_volume(&self.inner)
+	}
+
+	fn area(&self) -> f64 {
+		ffi::shape_surface_area(&self.inner)
+	}
+
+	fn center(&self) -> DVec3 {
+		let (mut x, mut y, mut z) = (0.0_f64, 0.0_f64, 0.0_f64);
+		ffi::shape_center_of_mass(&self.inner, &mut x, &mut y, &mut z);
+		DVec3::new(x, y, z)
+	}
+
+	fn inertia(&self) -> glam::DMat3 {
+		let (mut m00, mut m01, mut m02) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut m10, mut m11, mut m12) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut m20, mut m21, mut m22) = (0.0_f64, 0.0_f64, 0.0_f64);
+		ffi::shape_inertia_tensor(&self.inner,
+			&mut m00, &mut m01, &mut m02,
+			&mut m10, &mut m11, &mut m12,
+			&mut m20, &mut m21, &mut m22);
+		// OCCT fills row-major; DMat3::from_cols_array is column-major so
+		// transpose when handing the components over.
+		glam::DMat3::from_cols_array(&[
+			m00, m10, m20,
+			m01, m11, m21,
+			m02, m12, m22,
+		])
+	}
+
+	fn contains(&self, point: DVec3) -> bool {
+		ffi::shape_contains_point(&self.inner, point.x, point.y, point.z)
+	}
+
+	fn bounding_box(&self) -> [DVec3; 2] {
+		let (mut xmin, mut ymin, mut zmin) = (0.0_f64, 0.0_f64, 0.0_f64);
+		let (mut xmax, mut ymax, mut zmax) = (0.0_f64, 0.0_f64, 0.0_f64);
+		ffi::shape_bounding_box(&self.inner, &mut xmin, &mut ymin, &mut zmin, &mut xmax, &mut ymax, &mut zmax);
+		[DVec3::new(xmin, ymin, zmin), DVec3::new(xmax, ymax, zmax)]
+	}
+
+	// ==================== Color ====================
+
+	#[cfg(feature = "color")]
+	fn color(self, color: impl Into<crate::common::color::Color>) -> Self {
+		let c = color.into();
+		let colormap = ffi::shape_faces(&self.inner).iter().map(|f| (ffi::face_tshape_id(f), c)).collect();
+		Self::new(self.inner, colormap, self.history)
+	}
+
+	#[cfg(feature = "color")]
+	fn color_clear(self) -> Self {
+		Self::new(self.inner, std::collections::HashMap::new(), self.history)
 	}
 }
 
@@ -544,95 +643,6 @@ impl Transform for Solid {
 	}
 }
 
-// ==================== impl Compound for Solid ====================
-//
-// Solid-specific per-element ops (queries / color / boolean wrappers / clean).
-// `Vec<Solid>` and `[Solid; N]` impls live in src/traits.rs and delegate to this one.
-impl Compound for Solid {
-	type Elem = Solid;
-
-	// ==================== Queries ====================
-
-	fn volume(&self) -> f64 {
-		ffi::shape_volume(&self.inner)
-	}
-
-	fn area(&self) -> f64 {
-		ffi::shape_surface_area(&self.inner)
-	}
-
-	fn center(&self) -> DVec3 {
-		let (mut x, mut y, mut z) = (0.0_f64, 0.0_f64, 0.0_f64);
-		ffi::shape_center_of_mass(&self.inner, &mut x, &mut y, &mut z);
-		DVec3::new(x, y, z)
-	}
-
-	fn inertia(&self) -> glam::DMat3 {
-		let (mut m00, mut m01, mut m02) = (0.0_f64, 0.0_f64, 0.0_f64);
-		let (mut m10, mut m11, mut m12) = (0.0_f64, 0.0_f64, 0.0_f64);
-		let (mut m20, mut m21, mut m22) = (0.0_f64, 0.0_f64, 0.0_f64);
-		ffi::shape_inertia_tensor(&self.inner,
-			&mut m00, &mut m01, &mut m02,
-			&mut m10, &mut m11, &mut m12,
-			&mut m20, &mut m21, &mut m22);
-		// OCCT fills row-major; DMat3::from_cols_array is column-major so
-		// transpose when handing the components over.
-		glam::DMat3::from_cols_array(&[
-			m00, m10, m20,
-			m01, m11, m21,
-			m02, m12, m22,
-		])
-	}
-
-	fn contains(&self, point: DVec3) -> bool {
-		ffi::shape_contains_point(&self.inner, point.x, point.y, point.z)
-	}
-
-	fn bounding_box(&self) -> [DVec3; 2] {
-		let (mut xmin, mut ymin, mut zmin) = (0.0_f64, 0.0_f64, 0.0_f64);
-		let (mut xmax, mut ymax, mut zmax) = (0.0_f64, 0.0_f64, 0.0_f64);
-		ffi::shape_bounding_box(&self.inner, &mut xmin, &mut ymin, &mut zmin, &mut xmax, &mut ymax, &mut zmax);
-		[DVec3::new(xmin, ymin, zmin), DVec3::new(xmax, ymax, zmax)]
-	}
-
-	// ==================== Color ====================
-
-	#[cfg(feature = "color")]
-	fn color(self, color: impl Into<crate::common::color::Color>) -> Self {
-		let c = color.into();
-		let colormap = ffi::shape_faces(&self.inner).iter().map(|f| (ffi::face_tshape_id(f), c)).collect();
-		Self::new(self.inner, colormap, self.history)
-	}
-
-	#[cfg(feature = "color")]
-	fn color_clear(self) -> Self {
-		Self::new(self.inner, std::collections::HashMap::new(), self.history)
-	}
-
-	// ==================== Boolean ====================
-
-	fn union<'a>(&self, tool: impl IntoIterator<Item = &'a Solid>) -> Result<Vec<Solid>, Error> {
-		<Solid as SolidStruct>::boolean_union([self], tool)
-	}
-
-	fn subtract<'a>(&self, tool: impl IntoIterator<Item = &'a Solid>) -> Result<Vec<Solid>, Error> {
-		<Solid as SolidStruct>::boolean_subtract([self], tool)
-	}
-
-	fn intersect<'a>(&self, tool: impl IntoIterator<Item = &'a Solid>) -> Result<Vec<Solid>, Error> {
-		<Solid as SolidStruct>::boolean_intersect([self], tool)
-	}
-	
-	fn iter_elem(&self) -> impl Iterator<Item = &Self::Elem> + '_ {
-		panic!("Cannot iter_elem on Solid, because Solid is not Compound");
-		#[allow(unreachable_code)] std::iter::empty()
-	}
-
-	fn map_elem(self, _f: impl FnMut(Self::Elem) -> Self::Elem) -> Self {
-		panic!("Cannot map_elem on Solid, because Solid is not Compound")
-	}
-}
-
 impl Clone for Solid {
 	fn clone(&self) -> Self {
 		let inner = ffi::deep_copy(&self.inner);
@@ -649,63 +659,3 @@ impl Clone for Solid {
 	}
 }
 
-// ==================== Boolean operations ====================
-
-#[cfg(feature = "color")]
-fn merge_colormaps(history: &[u64], colormap_a: &std::collections::HashMap<u64, crate::common::color::Color>, colormap_b: &std::collections::HashMap<u64, crate::common::color::Color>) -> std::collections::HashMap<u64, crate::common::color::Color> {
-	let mut result = std::collections::HashMap::new();
-	for pair in history.chunks_exact(2) {
-		// TShape* pointers are globally unique across both inputs, so a
-		// single lookup against either colormap suffices (no collision).
-		if let Some(&color) = colormap_a.get(&pair[1]).or_else(|| colormap_b.get(&pair[1])) {
-			result.insert(pair[0], color);
-		}
-	}
-	result
-}
-
-// `ca` / `cb` carry the source colormaps and are only consulted by the
-// `color` feature; the boolean result and history are derived purely from
-// the FFI out-parameter, so they go unused without `color`.
-#[cfg_attr(not(feature = "color"), allow(unused_variables))]
-fn build_boolean_result(inner: cxx::UniquePtr<ffi::TopoDS_Shape>, history: Vec<u64>, ca: CompoundShape, cb: CompoundShape) -> Result<Vec<Solid>, Error> {
-	#[cfg(feature = "color")]
-	let colormap = merge_colormaps(&history, ca.colormap(), cb.colormap());
-
-	let compound = CompoundShape::from_raw(
-		inner,
-		#[cfg(feature = "color")]
-		colormap,
-		history,
-	);
-
-	Ok(compound.decompose())
-}
-
-// Op kind tags matching the C++ side `boolean_op` switch.
-const BOOLEAN_OP_FUSE: u32 = 0;
-const BOOLEAN_OP_CUT: u32 = 1;
-const BOOLEAN_OP_COMMON: u32 = 2;
-
-impl Solid {
-	fn boolean_op_impl<'a, 'b>(a: impl IntoIterator<Item = &'a Solid>, b: impl IntoIterator<Item = &'b Solid>, op_kind: u32) -> Result<Vec<Solid>, Error> {
-		let ca = CompoundShape::new(a);
-		let cb = CompoundShape::new(b);
-		let mut history: Vec<u64> = Default::default();
-		let inner = ffi::builder_boolean(ca.inner(), cb.inner(), op_kind, &mut history);
-		if inner.is_null() { return Err(Error::BooleanOperationFailed); }
-		build_boolean_result(inner, history, ca, cb)
-	}
-
-	pub(crate) fn boolean_union_impl<'a, 'b>(a: impl IntoIterator<Item = &'a Solid>, b: impl IntoIterator<Item = &'b Solid>) -> Result<Vec<Solid>, Error> {
-		Self::boolean_op_impl(a, b, BOOLEAN_OP_FUSE)
-	}
-
-	pub(crate) fn boolean_subtract_impl<'a, 'b>(a: impl IntoIterator<Item = &'a Solid>, b: impl IntoIterator<Item = &'b Solid>) -> Result<Vec<Solid>, Error> {
-		Self::boolean_op_impl(a, b, BOOLEAN_OP_CUT)
-	}
-
-	pub(crate) fn boolean_intersect_impl<'a, 'b>(a: impl IntoIterator<Item = &'a Solid>, b: impl IntoIterator<Item = &'b Solid>) -> Result<Vec<Solid>, Error> {
-		Self::boolean_op_impl(a, b, BOOLEAN_OP_COMMON)
-	}
-}

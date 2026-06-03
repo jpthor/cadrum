@@ -3,17 +3,6 @@ use super::color::Color;
 use glam::{DVec2, DVec3};
 use std::collections::HashMap;
 
-/// 3D edge polylines for SVG rendering.
-///
-/// Stores topological edges as 3D polylines. Visibility classification
-/// (visible vs hidden) is computed by [`Mesh::to_svg`] when hidden line
-/// rendering is enabled.
-#[derive(Debug, Clone, Default)]
-pub struct EdgeData {
-	/// 3D polylines representing topological edges.
-	pub polylines: Vec<Vec<DVec3>>,
-}
-
 /// A triangle mesh produced by meshing a solid shape.
 ///
 /// All vectors have the same length: one entry per vertex.
@@ -24,8 +13,6 @@ pub struct Mesh {
 	pub vertices: Vec<DVec3>,
 	/// UV coordinates, normalized to [0, 1] per face.
 	pub uvs: Vec<DVec2>,
-	/// Vertex normals.
-	pub normals: Vec<DVec3>,
 	/// Triangle indices (groups of 3, referencing into `vertices`).
 	pub indices: Vec<usize>,
 	/// Per-triangle face ID. Length equals `indices.len() / 3`.
@@ -34,10 +21,33 @@ pub struct Mesh {
 	#[cfg(feature = "color")]
 	pub colormap: HashMap<u64, Color>,
 	/// Topological edge polylines for SVG rendering.
-	pub edges: EdgeData,
+	pub edges: Vec<Vec<DVec3>>,
 }
 
-// ==================== STL ====================
+/// 2D rendering scene derived from a `Mesh` viewed from a given camera.
+///
+/// Backend-agnostic intermediate: the projection / shading / silhouette /
+/// occlusion pipeline produces this, and SVG / PNG / other backends consume it.
+///
+/// Invariants:
+/// - `triangles.len() == color.len()`
+/// - `triangles` is pre-sorted back-to-front (painter's algorithm)
+/// - In `edges_visible` / `edges_hidden`, polylines are concatenated with a
+///   single `DVec2::NAN` between them. `[p0, p1, p2, NaN, p3, p4]` means the
+///   two polylines `p0-p1-p2` and `p3-p4`. No trailing NaN; leading/consecutive
+///   NaNs are treated as empty polylines and ignored.
+#[derive(Debug, Clone)]
+pub struct Scene2D {
+	/// Projected triangles (back-to-front draw order).
+	pub triangles: Vec<[DVec2; 3]>,
+	/// Per-triangle RGB byte color with shading already baked in.
+	pub color: Vec<[u8; 3]>,
+	/// Visible edge polylines, NaN-separated.
+	pub edges_visible: Vec<DVec2>,
+	/// Occluded edge polylines, NaN-separated. Empty when hidden lines were
+	/// disabled at scene construction.
+	pub edges_hidden: Vec<DVec2>,
+}
 
 impl Mesh {
 	/// Write this mesh as binary STL to a writer.
@@ -65,98 +75,61 @@ impl Mesh {
 			}
 			// Attribute byte count — RGB555 color (SolidView/MeshLab convention)
 			#[cfg(feature = "color")]
-			let attr = {
-				let face_id = self.face_ids[ti];
-				if let Some(c) = self.colormap.get(&face_id) {
-					let r = (c.r * 31.0) as u16;
-					let g = (c.g * 31.0) as u16;
-					let b = (c.b * 31.0) as u16;
-					0x8000 | r | (g << 5) | (b << 10)
-				} else {
-					0u16
-				}
-			};
+			let attr = self.colormap.get(&self.face_ids[ti]).map_or(0, Color::as_u16);
 			#[cfg(not(feature = "color"))]
 			let attr = 0u16;
 			writer.write_all(&attr.to_le_bytes()).map_err(|_| super::error::Error::StlWriteFailed)?;
 		}
 		Ok(())
 	}
-}
 
-// ==================== SVG ====================
-
-impl Mesh {
-	/// Render this mesh as an SVG string.
+	/// Build a 2D scene from this mesh for the given camera.
 	///
-	/// `view` is the viewing direction (the direction the camera looks from;
-	/// points with higher `dot(view)` are closer to the camera).
+	/// - `view`: camera direction (higher `dot(view)` = closer).
+	/// - `up`: world-space up axis on the output. Gram-Schmidt-orthogonalized
+	///   against `view`. Panics if zero or parallel to `view`.
+	/// - `hidden_lines`: classify occluded edges into `Scene2D::edges_hidden`.
+	///   When `false`, hidden edges are dropped entirely.
+	/// - `shading`: Lambertian shading with light == `view`. On for curved
+	///   shapes, off for flat CAD-style output.
 	///
-	/// `up` controls which world-space direction points up on the output
-	/// SVG. It is Gram-Schmidt-orthogonalized against `view`, so it need
-	/// not be exactly perpendicular — only non-zero and non-parallel to
-	/// `view`. Engineering convention (Z-up, e.g. VMEC / parastell / most
-	/// CAD tools) maps directly: pass `DVec3::Z`. Panics if `view` is zero,
-	/// `up` is zero, or `up` is parallel to `view` — all of which are
-	/// programmer errors, treated like the degenerate-input panics in
-	/// `Transform::align_x`.
-	///
-	/// `hidden_lines` controls whether occluded edges are rendered as faint dashed
-	/// lines. Set to `false` for cleaner output on dense models (e.g. helical
-	/// sweeps) where hidden lines dominate the image.
-	///
-	/// `shading` enables Lambertian shading with head-on light
-	/// (light direction == `view`). Front-facing triangles get
-	/// `shade = 0.5 + 0.5 * (normal · view)`, so glancing faces darken to
-	/// half intensity. Turn this on for curved/organic shapes where flat
-	/// fill makes the 3D form hard to read; leave it off for clean flat
-	/// rendering matching earlier cadrum output.
-	///
-	/// The method:
-	/// 1. Projects triangles onto the plane perpendicular to `view`
-	/// 2. Detects silhouette edges from mesh adjacency
-	/// 3. Classifies edges as visible or hidden (only when `hidden_lines`)
-	/// 4. Renders colored triangles, visible edges (black), and optionally hidden edges
-	pub fn write_svg<W: std::io::Write>(&self, view: DVec3, up: DVec3, hidden_lines: bool, shading: bool, writer: &mut W) -> Result<(), super::error::Error> {
-		writer.write_all(self.to_svg(view, up, hidden_lines, shading).as_bytes()).map_err(|_| super::error::Error::SvgExportFailed)
-	}
-
-	pub fn to_svg(&self, view: DVec3, up: DVec3, hidden_lines: bool, shading: bool) -> String {
+	/// Render via `Scene2D::to_svg` / `Scene2D::write_svg`.
+	pub fn scene(&self, view: DVec3, up: DVec3, hidden_lines: bool, shading: bool) -> Scene2D {
 		let (u, v, dir) = projection_basis(view, up);
 
-		// 1. Project and sort triangles for rendering
-		let face_triangles = project_and_sort_triangles(self, dir, u, v, shading);
+		let (triangles, color) = project_and_sort_triangles(self, dir, u, v, shading);
 
-		// 2. Detect silhouette edges from mesh adjacency
 		let silhouette_edges = detect_silhouette_edges(self, dir);
+		let all_edges: Vec<&Vec<DVec3>> = self.edges.iter().chain(silhouette_edges.iter()).collect();
 
-		// 3. Combine topological edges + silhouette edges
-		let all_edges: Vec<&Vec<DVec3>> = self.edges.polylines.iter().chain(silhouette_edges.iter()).collect();
-
-		// 4. Classify edges. When hidden lines are disabled we still need to
-		//    drop occluded segments from the visible set, so build occlusion
-		//    data and reuse the same classifier — only the hidden output is
-		//    discarded.
+		// Even when hidden lines are not rendered, we still need to drop
+		// occluded segments from the visible set — so always classify, then
+		// throw away the hidden output when disabled.
 		let occlusion_tris = build_occlusion_data(self, dir, u, v);
-		let (visible, hidden) = classify_edges(&all_edges, &occlusion_tris, dir, u, v);
-		let hidden = if hidden_lines { hidden } else { Vec::new() };
+		let (edges_visible, hidden) = classify_edges(&all_edges, &occlusion_tris, dir, u, v);
+		let edges_hidden = if hidden_lines { hidden } else { Vec::new() };
 
-		// 5. Build SVG
-		build_svg(&face_triangles, &visible, &hidden)
+		Scene2D { triangles, color, edges_visible, edges_hidden }
 	}
 }
 
-// ==================== SVG internals ====================
+// ==================== Scene pipeline internals ====================
 
-struct SvgTriangle {
-	pts: [(f64, f64); 3],
-	depth: f64,
-	fill: String,
+/// Per-triangle face normal from the cross product of its two edges.
+/// Not normalized — callers that need a unit vector should normalize.
+/// Sign convention matches the STL writer at `Mesh::write_stl`: outward-
+/// pointing for face-orientation-consistent winding (which OCCT meshing
+/// produces).
+fn tri_normal(mesh: &Mesh, ti: usize) -> DVec3 {
+	let i0 = mesh.indices[ti * 3];
+	let i1 = mesh.indices[ti * 3 + 1];
+	let i2 = mesh.indices[ti * 3 + 2];
+	(mesh.vertices[i1] - mesh.vertices[i0]).cross(mesh.vertices[i2] - mesh.vertices[i0])
 }
 
 /// Projected front-facing triangle for occlusion testing.
 struct OcclusionTri {
-	pts: [(f64, f64); 3],
+	pts: [DVec2; 3],
 	depths: [f64; 3],
 }
 
@@ -182,9 +155,12 @@ fn projection_basis(view: DVec3, up: DVec3) -> (DVec3, DVec3, DVec3) {
 	(u, v, dir)
 }
 
-fn project_and_sort_triangles(mesh: &Mesh, dir: DVec3, u: DVec3, v: DVec3, shading: bool) -> Vec<SvgTriangle> {
+/// Project all front-facing triangles to 2D, compute per-triangle shaded
+/// color, and return both vectors sorted back-to-front by centroid depth.
+fn project_and_sort_triangles(mesh: &Mesh, dir: DVec3, u: DVec3, v: DVec3, shading: bool) -> (Vec<[DVec2; 3]>, Vec<[u8; 3]>) {
 	let tri_count = mesh.indices.len() / 3;
-	let mut triangles = Vec::with_capacity(tri_count);
+	// Build with depth so we can sort, then strip it.
+	let mut buf: Vec<([DVec2; 3], [u8; 3], f64)> = Vec::with_capacity(tri_count);
 
 	for ti in 0..tri_count {
 		let i0 = mesh.indices[ti * 3];
@@ -195,26 +171,25 @@ fn project_and_sort_triangles(mesh: &Mesh, dir: DVec3, u: DVec3, v: DVec3, shadi
 		let v1 = mesh.vertices[i1];
 		let v2 = mesh.vertices[i2];
 
-		let avg_normal = (mesh.normals[i0] + mesh.normals[i1] + mesh.normals[i2]) / 3.0;
-		if avg_normal.dot(dir) < 0.0 {
+		let face_normal = tri_normal(mesh, ti);
+		if face_normal.dot(dir) < 0.0 {
 			continue;
 		}
 
-		let p0 = (v0.dot(u), v0.dot(v));
-		let p1 = (v1.dot(u), v1.dot(v));
-		let p2 = (v2.dot(u), v2.dot(v));
+		let p0 = DVec2::new(v0.dot(u), v0.dot(v));
+		let p1 = DVec2::new(v1.dot(u), v1.dot(v));
+		let p2 = DVec2::new(v2.dot(u), v2.dot(v));
 
 		let depth = (v0.dot(dir) + v1.dot(dir) + v2.dot(dir)) / 3.0;
 
 		// Lambertian shading with head-on light (light direction == view direction).
 		// Front-facing triangles get `normal · dir ∈ (0, 1]`; normalize to handle
-		// the averaged normal's non-unit length. Shade maps [0, 1] → [0.5, 1.0]
+		// the face normal's non-unit length. Shade maps [0, 1] → [0.5, 1.0]
 		// so glancing faces darken to half-intensity (not black) — enough to
 		// read the 3D shape without swallowing the silhouette into the stroke.
-		// When `shading` is false, every triangle gets shade=1.0 → flat fill,
-		// matching the pre-shading output (`#ddd` for no-color path).
+		// When `shading` is false, every triangle gets shade=1.0 → flat fill.
 		let shade = if shading {
-			let dot = avg_normal.normalize_or_zero().dot(dir).clamp(0.0, 1.0);
+			let dot = face_normal.normalize_or_zero().dot(dir).clamp(0.0, 1.0);
 			0.5 + 0.5 * dot
 		} else {
 			1.0
@@ -233,22 +208,24 @@ fn project_and_sort_triangles(mesh: &Mesh, dir: DVec3, u: DVec3, v: DVec3, shadi
 		#[cfg(not(feature = "color"))]
 		let (base_r, base_g, base_b) = (gray, gray, gray);
 
-		// Emit fill as `#rrggbb` hex (7 chars) — shorter than `rgb(R,G,B)`.
-		// When `shading` is off, `shade == 1.0` so the formula collapses to
-		// the base color (every front-facing triangle shares the same fill
-		// and the SVG stays compact).
-		let fill = format!(
-			"#{:02x}{:02x}{:02x}",
+		let color = [
 			(base_r * shade * 255.0) as u8,
 			(base_g * shade * 255.0) as u8,
 			(base_b * shade * 255.0) as u8,
-		);
+		];
 
-		triangles.push(SvgTriangle { pts: [p0, p1, p2], depth, fill });
+		buf.push(([p0, p1, p2], color, depth));
 	}
 
-	triangles.sort_by(|a, b| a.depth.partial_cmp(&b.depth).unwrap_or(std::cmp::Ordering::Equal));
-	triangles
+	buf.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+	let mut triangles = Vec::with_capacity(buf.len());
+	let mut colors = Vec::with_capacity(buf.len());
+	for (pts, color, _) in buf {
+		triangles.push(pts);
+		colors.push(color);
+	}
+	(triangles, colors)
 }
 
 /// Build projected front-facing triangles for occlusion testing.
@@ -265,12 +242,14 @@ fn build_occlusion_data(mesh: &Mesh, dir: DVec3, u: DVec3, v: DVec3) -> Vec<Occl
 		let v1 = mesh.vertices[i1];
 		let v2 = mesh.vertices[i2];
 
-		let avg_normal = (mesh.normals[i0] + mesh.normals[i1] + mesh.normals[i2]) / 3.0;
-		if avg_normal.dot(dir) <= 0.0 {
+		if tri_normal(mesh, ti).dot(dir) <= 0.0 {
 			continue;
 		}
 
-		tris.push(OcclusionTri { pts: [(v0.dot(u), v0.dot(v)), (v1.dot(u), v1.dot(v)), (v2.dot(u), v2.dot(v))], depths: [v0.dot(dir), v1.dot(dir), v2.dot(dir)] });
+		tris.push(OcclusionTri {
+			pts: [DVec2::new(v0.dot(u), v0.dot(v)), DVec2::new(v1.dot(u), v1.dot(v)), DVec2::new(v2.dot(u), v2.dot(v))],
+			depths: [v0.dot(dir), v1.dot(dir), v2.dot(dir)],
+		});
 	}
 	tris
 }
@@ -283,7 +262,6 @@ fn build_occlusion_data(mesh: &Mesh, dir: DVec3, u: DVec3, v: DVec3) -> Vec<Occl
 fn detect_silhouette_edges(mesh: &Mesh, dir: DVec3) -> Vec<Vec<DVec3>> {
 	let tri_count = mesh.indices.len() / 3;
 
-	// Build edge → triangle adjacency map
 	let mut edge_tris: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
 	for ti in 0..tri_count {
 		let i0 = mesh.indices[ti * 3];
@@ -298,10 +276,8 @@ fn detect_silhouette_edges(mesh: &Mesh, dir: DVec3) -> Vec<Vec<DVec3>> {
 	let mut silhouettes = Vec::new();
 	for (&(a, b), tris) in &edge_tris {
 		let is_silhouette = if tris.len() == 1 {
-			// Boundary edge: silhouette if the single adjacent face is front-facing
 			tri_facing(mesh, tris[0], dir)
 		} else if tris.len() == 2 {
-			// Contour edge: one front-facing, one back-facing
 			tri_facing(mesh, tris[0], dir) != tri_facing(mesh, tris[1], dir)
 		} else {
 			false
@@ -313,62 +289,45 @@ fn detect_silhouette_edges(mesh: &Mesh, dir: DVec3) -> Vec<Vec<DVec3>> {
 	silhouettes
 }
 
-/// Returns true if triangle `ti` is front-facing relative to `dir`.
 fn tri_facing(mesh: &Mesh, ti: usize, dir: DVec3) -> bool {
-	let i0 = mesh.indices[ti * 3];
-	let i1 = mesh.indices[ti * 3 + 1];
-	let i2 = mesh.indices[ti * 3 + 2];
-	let avg_normal = (mesh.normals[i0] + mesh.normals[i1] + mesh.normals[i2]) / 3.0;
-	avg_normal.dot(dir) > 0.0
+	tri_normal(mesh, ti).dot(dir) > 0.0
 }
 
-/// Classify edge segments as visible or hidden based on triangle occlusion.
-///
-/// Returns (visible_polylines, hidden_polylines) as 2D projected coordinates.
-fn classify_edges(edges: &[&Vec<DVec3>], occlusion_tris: &[OcclusionTri], dir: DVec3, u: DVec3, v: DVec3) -> (Vec<Vec<(f64, f64)>>, Vec<Vec<(f64, f64)>>) {
-	let mut visible_polylines = Vec::new();
-	let mut hidden_polylines = Vec::new();
+/// Classify edge segments as visible or hidden by occlusion against the
+/// front-facing triangle set. Output: NaN-separated 2D polyline lists for
+/// each class.
+fn classify_edges(edges: &[&Vec<DVec3>], occlusion_tris: &[OcclusionTri], dir: DVec3, u: DVec3, v: DVec3) -> (Vec<DVec2>, Vec<DVec2>) {
+	let mut visible: Vec<DVec2> = Vec::new();
+	let mut hidden: Vec<DVec2> = Vec::new();
 
 	for edge in edges {
 		if edge.len() < 2 {
 			continue;
 		}
 
-		let mut vis_line: Vec<(f64, f64)> = Vec::new();
-		let mut hid_line: Vec<(f64, f64)> = Vec::new();
+		let mut vis_line: Vec<DVec2> = Vec::new();
+		let mut hid_line: Vec<DVec2> = Vec::new();
 
 		for window in edge.windows(2) {
 			let a3d = window[0];
 			let b3d = window[1];
 			let mid = (a3d + b3d) * 0.5;
-			let mid_2d = (mid.dot(u), mid.dot(v));
+			let mid_2d = DVec2::new(mid.dot(u), mid.dot(v));
 			let mid_depth = mid.dot(dir);
 
-			let a_2d = (a3d.dot(u), a3d.dot(v));
-			let b_2d = (b3d.dot(u), b3d.dot(v));
+			let a_2d = DVec2::new(a3d.dot(u), a3d.dot(v));
+			let b_2d = DVec2::new(b3d.dot(u), b3d.dot(v));
 
-			let hidden = is_point_occluded(mid_2d, mid_depth, occlusion_tris);
+			let is_hidden = is_point_occluded(mid_2d, mid_depth, occlusion_tris);
 
-			if hidden {
-				// Flush visible line if any
-				if vis_line.len() >= 2 {
-					visible_polylines.push(std::mem::take(&mut vis_line));
-				} else {
-					vis_line.clear();
-				}
-				// Extend or start hidden line
+			if is_hidden {
+				flush_polyline(&mut visible, &mut vis_line);
 				if hid_line.is_empty() {
 					hid_line.push(a_2d);
 				}
 				hid_line.push(b_2d);
 			} else {
-				// Flush hidden line if any
-				if hid_line.len() >= 2 {
-					hidden_polylines.push(std::mem::take(&mut hid_line));
-				} else {
-					hid_line.clear();
-				}
-				// Extend or start visible line
+				flush_polyline(&mut hidden, &mut hid_line);
 				if vis_line.is_empty() {
 					vis_line.push(a_2d);
 				}
@@ -376,28 +335,36 @@ fn classify_edges(edges: &[&Vec<DVec3>], occlusion_tris: &[OcclusionTri], dir: D
 			}
 		}
 
-		if vis_line.len() >= 2 {
-			visible_polylines.push(vis_line);
-		}
-		if hid_line.len() >= 2 {
-			hidden_polylines.push(hid_line);
-		}
+		flush_polyline(&mut visible, &mut vis_line);
+		flush_polyline(&mut hidden, &mut hid_line);
 	}
 
-	(visible_polylines, hidden_polylines)
+	(visible, hidden)
 }
 
-/// Check if a 2D point at a given depth is occluded by any front-facing triangle.
-fn is_point_occluded(point_2d: (f64, f64), point_depth: f64, tris: &[OcclusionTri]) -> bool {
+/// Append a polyline (≥2 points) to a NaN-separated output buffer, then
+/// clear the staging buffer. No-op if the polyline is shorter than 2 points.
+fn flush_polyline(out: &mut Vec<DVec2>, staging: &mut Vec<DVec2>) {
+	if staging.len() < 2 {
+		staging.clear();
+		return;
+	}
+	if !out.is_empty() {
+		out.push(DVec2::NAN);
+	}
+	out.append(staging);
+}
+
+fn is_point_occluded(p: DVec2, point_depth: f64, tris: &[OcclusionTri]) -> bool {
 	// Tolerance for self-occlusion: edge lies on the surface, so its depth
 	// is approximately equal to the adjacent face's depth.
 	let eps = 1e-4;
 
 	for tri in tris {
-		if let Some((w0, w1, w2)) = barycentric_2d(point_2d, tri.pts) {
+		if let Some((w0, w1, w2)) = barycentric_2d(p, tri.pts) {
 			let tri_depth = w0 * tri.depths[0] + w1 * tri.depths[1] + w2 * tri.depths[2];
 			if tri_depth > point_depth + eps {
-				return true; // triangle is closer to camera than the edge
+				return true;
 			}
 		}
 	}
@@ -405,23 +372,17 @@ fn is_point_occluded(point_2d: (f64, f64), point_depth: f64, tris: &[OcclusionTr
 }
 
 /// Compute barycentric coordinates of point `p` in triangle `t` (2D).
-/// Returns Some((w0, w1, w2)) if the point is inside the triangle.
-fn barycentric_2d(p: (f64, f64), t: [(f64, f64); 3]) -> Option<(f64, f64, f64)> {
-	let (px, py) = p;
-	let (x0, y0) = t[0];
-	let (x1, y1) = t[1];
-	let (x2, y2) = t[2];
-
-	let denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+/// Returns `Some((w0, w1, w2))` if the point is inside the triangle.
+fn barycentric_2d(p: DVec2, t: [DVec2; 3]) -> Option<(f64, f64, f64)> {
+	let denom = (t[1].y - t[2].y) * (t[0].x - t[2].x) + (t[2].x - t[1].x) * (t[0].y - t[2].y);
 	if denom.abs() < 1e-12 {
-		return None; // degenerate triangle
+		return None;
 	}
 
-	let w0 = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) / denom;
-	let w1 = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) / denom;
+	let w0 = ((t[1].y - t[2].y) * (p.x - t[2].x) + (t[2].x - t[1].x) * (p.y - t[2].y)) / denom;
+	let w1 = ((t[2].y - t[0].y) * (p.x - t[2].x) + (t[0].x - t[2].x) * (p.y - t[2].y)) / denom;
 	let w2 = 1.0 - w0 - w1;
 
-	// Small negative tolerance for edges
 	if w0 >= -1e-8 && w1 >= -1e-8 && w2 >= -1e-8 {
 		Some((w0, w1, w2))
 	} else {
@@ -429,120 +390,518 @@ fn barycentric_2d(p: (f64, f64), t: [(f64, f64); 3]) -> Option<(f64, f64, f64)> 
 	}
 }
 
-// ==================== SVG generation ====================
+// ==================== Scene2D layout (shared by backends) ====================
 
-fn polylines_to_svg(svg: &mut String, polylines: &[Vec<(f64, f64)>], stroke: &str, dash: &str, width: Option<f64>) {
-	for line in polylines {
-		svg.push_str("<polyline points=\"");
-		for (i, &(x, y)) in line.iter().enumerate() {
-			let y = -y;
-			if i > 0 {
-				svg.push(' ');
-			}
-			svg.push_str(&format!("{x:.4},{y:.4}"));
+/// Viewport + stroke parameters derived from `Scene2D::viewbox`. Shared by
+/// SVG and PNG backends so both honor the same margin / stroke / dash ratios.
+/// All units are scene units; per-backend code converts to its target space
+/// (SVG keeps scene units; PNG multiplies by pixels-per-scene-unit).
+struct Layout {
+	/// Output rect in scene-style coordinates with Y already flipped (origin
+	/// at top-left, matching SVG `viewBox` and pixel image conventions).
+	vx: f64,
+	vy: f64,
+	vw: f64,
+	vh: f64,
+	stroke_width: f64,
+	hidden_stroke_width: f64,
+	dash_len: f64,
+	dash_gap: f64,
+}
+
+impl Scene2D {
+	/// Bounding box `[min, max]` of all projected triangle vertices.
+	/// Falls back to `[0,1]×[0,1]` when the scene is empty. Edges always
+	/// lie on the projected surface (= union of front-facing triangles),
+	/// so they don't extend the bbox and are not scanned here.
+	pub fn viewbox(&self) -> [DVec2; 2] {
+		let init = (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY));
+		let (min, max) = self.triangles.iter().flatten().copied()
+			.fold(init, |(mn, mx), p| (mn.min(p), mx.max(p)));
+		if min.x > max.x { [DVec2::ZERO, DVec2::ONE] } else { [min, max] }
+	}
+
+	fn layout(&self) -> Layout {
+		let [min, max] = self.viewbox();
+		let margin_frac = 0.05;
+		let w = max.x - min.x;
+		let h = max.y - min.y;
+		let span = w.max(h);
+		let margin = span * margin_frac;
+		let stroke_width = span * 0.003;
+		Layout {
+			vx: min.x - margin,
+			// SVG / image Y axis points down, so flip Y for the output rect.
+			vy: -(max.y + margin),
+			vw: w + margin * 2.0,
+			vh: h + margin * 2.0,
+			stroke_width,
+			// Hidden lines: thinner stroke and longer dashes to reduce
+			// visual clutter on dense models (e.g. helical sweeps).
+			hidden_stroke_width: stroke_width * 0.6,
+			dash_len: stroke_width * 5.0,
+			dash_gap: stroke_width * 4.0,
 		}
-		svg.push_str("\" fill=\"none\" stroke=\"");
-		svg.push_str(stroke);
-		svg.push('"');
-		if let Some(w) = width {
-			svg.push_str(&format!(" stroke-width=\"{w:.4}\""));
-		}
-		if !dash.is_empty() {
-			svg.push_str(" stroke-dasharray=\"");
-			svg.push_str(dash);
-			svg.push('"');
-		}
-		svg.push_str("/>\n");
 	}
 }
 
-fn build_svg(triangles: &[SvgTriangle], visible_lines: &[Vec<(f64, f64)>], hidden_lines: &[Vec<(f64, f64)>]) -> String {
-	// Compute bounding box from triangles and edges
-	let mut min_x = f64::INFINITY;
-	let mut min_y = f64::INFINITY;
-	let mut max_x = f64::NEG_INFINITY;
-	let mut max_y = f64::NEG_INFINITY;
+// ==================== Scene2D → SVG backend ====================
 
-	for tri in triangles {
-		for &(x, y) in &tri.pts {
-			if x < min_x {
-				min_x = x;
-			}
-			if x > max_x {
-				max_x = x;
-			}
-			if y < min_y {
-				min_y = y;
-			}
-			if y > max_y {
-				max_y = y;
-			}
-		}
-	}
+impl Scene2D {
+	/// Write this scene as an SVG to a writer.
+	pub fn write_svg<W: std::io::Write>(&self, writer: &mut W) -> Result<(), super::error::Error> {
+		let Layout { vx, vy, vw, vh, stroke_width: sw, hidden_stroke_width: hidden_sw, dash_len, dash_gap } = self.layout();
 
-	for lines in [visible_lines, hidden_lines] {
-		for line in lines {
-			for &(x, y) in line {
-				if x < min_x {
-					min_x = x;
-				}
-				if x > max_x {
-					max_x = x;
-				}
-				if y < min_y {
-					min_y = y;
-				}
-				if y > max_y {
-					max_y = y;
-				}
-			}
-		}
-	}
-
-	// Handle empty case
-	if min_x > max_x {
-		min_x = 0.0;
-		max_x = 1.0;
-		min_y = 0.0;
-		max_y = 1.0;
-	}
-
-	let margin_frac = 0.05;
-	let w = max_x - min_x;
-	let h = max_y - min_y;
-	let margin = if w > h { w } else { h } * margin_frac;
-	let vx = min_x - margin;
-	let vy = -(max_y + margin);
-	let vw = w + margin * 2.0;
-	let vh = h + margin * 2.0;
-	let sw = (if w > h { w } else { h }) * 0.003;
-	// Hidden lines: thinner stroke and longer dashes to reduce visual clutter
-	// on dense models (e.g. helical sweeps).
-	let hidden_sw = sw * 0.6;
-	let dash_len = sw * 5.0;
-	let dash_gap = sw * 4.0;
-
-	let mut svg = String::with_capacity(4096 + triangles.len() * 120);
-	svg.push_str(&format!(
-		"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{vx:.4} {vy:.4} {vw:.4} {vh:.4}\" \
-		 stroke-width=\"{sw:.4}\">\n"
-	));
-
-	for tri in triangles {
-		let [(x0, y0), (x1, y1), (x2, y2)] = tri.pts;
-		let y0 = -y0;
-		let y1 = -y1;
-		let y2 = -y2;
+		let mut svg = String::with_capacity(4096 + self.triangles.len() * 120);
 		svg.push_str(&format!(
-			"<polygon points=\"{x0:.4},{y0:.4} {x1:.4},{y1:.4} {x2:.4},{y2:.4}\" \
-			 fill=\"{}\" stroke=\"none\"/>\n",
-			tri.fill
+			"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{vx:.4} {vy:.4} {vw:.4} {vh:.4}\" \
+			 stroke-width=\"{sw:.4}\">\n"
 		));
+
+		for (tri, color) in self.triangles.iter().zip(self.color.iter()) {
+			let [p0, p1, p2] = *tri;
+			let [r, g, b] = *color;
+			svg.push_str(&format!(
+				"<polygon points=\"{:.4},{:.4} {:.4},{:.4} {:.4},{:.4}\" \
+				 fill=\"#{r:02x}{g:02x}{b:02x}\" stroke=\"none\"/>\n",
+				p0.x, -p0.y, p1.x, -p1.y, p2.x, -p2.y,
+			));
+		}
+
+		polylines_to_svg(&mut svg, &self.edges_visible, "black", "", None);
+		polylines_to_svg(&mut svg, &self.edges_hidden, "#bbb", &format!("{dash_len:.4},{dash_gap:.4}"), Some(hidden_sw));
+
+		svg.push_str("</svg>\n");
+		writer.write_all(svg.as_bytes()).map_err(|_| super::error::Error::SvgExportFailed)
+	}
+}
+
+/// Walk a NaN-separated polyline buffer and emit one `<polyline>` per
+/// segment of consecutive non-NaN points.
+fn polylines_to_svg(svg: &mut String, polylines: &[DVec2], stroke: &str, dash: &str, width: Option<f64>) {
+	let mut start = 0;
+	for i in 0..=polylines.len() {
+		let is_sep = i == polylines.len() || polylines[i].is_nan();
+		if is_sep {
+			let line = &polylines[start..i];
+			if line.len() >= 2 {
+				emit_polyline(svg, line, stroke, dash, width);
+			}
+			start = i + 1;
+		}
+	}
+}
+
+fn emit_polyline(svg: &mut String, line: &[DVec2], stroke: &str, dash: &str, width: Option<f64>) {
+	svg.push_str("<polyline points=\"");
+	for (i, p) in line.iter().enumerate() {
+		if i > 0 {
+			svg.push(' ');
+		}
+		svg.push_str(&format!("{:.4},{:.4}", p.x, -p.y));
+	}
+	svg.push_str("\" fill=\"none\" stroke=\"");
+	svg.push_str(stroke);
+	svg.push('"');
+	if let Some(w) = width {
+		svg.push_str(&format!(" stroke-width=\"{w:.4}\""));
+	}
+	if !dash.is_empty() {
+		svg.push_str(" stroke-dasharray=\"");
+		svg.push_str(dash);
+		svg.push('"');
+	}
+	svg.push_str("/>\n");
+}
+
+// ==================== Scene2D → PNG backend ====================
+
+impl Scene2D {
+	/// Rasterize this scene as a PNG and write to a writer.
+	///
+	/// `dimensions` is `[width, height]` in pixels. The scene aspect ratio
+	/// (from `viewbox`) is preserved by scaling to fit and centering — the
+	/// remainder (when the requested aspect doesn't match the scene's) is
+	/// transparent. Anti-aliased via `tiny-skia`. Background is transparent;
+	/// composite over your desired color downstream if needed.
+	#[cfg(feature = "png")]
+	pub fn write_png<W: std::io::Write>(&self, dimensions: [usize; 2], writer: &mut W) -> Result<(), super::error::Error> {
+		use tiny_skia::{Pixmap, Transform};
+
+		let [width, height] = dimensions;
+		let layout = self.layout();
+
+		// Preserve aspect: pick the smaller per-axis scale so the whole
+		// viewbox fits, then center the content within the pixmap.
+		let pps = ((width as f64) / layout.vw).min((height as f64) / layout.vh);
+		let off_x = (width as f64 - layout.vw * pps) / 2.0;
+		let off_y = (height as f64 - layout.vh * pps) / 2.0;
+
+		// Scene→pixel transform. SVG y was already flipped in `layout.vy`,
+		// so the same `(vx, vy)` origin maps to pixel `(off_x, off_y)` once
+		// we scale scene-y by `-pps`.
+		let s = pps as f32;
+		let tx = -(layout.vx as f32) * s + off_x as f32;
+		let ty = -(layout.vy as f32) * s + off_y as f32;
+		let transform = Transform::from_row(s, 0.0, 0.0, -s, tx, ty);
+
+		let mut pixmap = Pixmap::new(width as u32, height as u32).ok_or(super::error::Error::PngExportFailed)?;
+		self.render_to_pixmap(
+			&mut pixmap,
+			transform,
+			layout.stroke_width as f32,
+			layout.hidden_stroke_width as f32,
+			layout.dash_len as f32,
+			layout.dash_gap as f32,
+		);
+
+		let png_bytes = pixmap.encode_png().map_err(|_| super::error::Error::PngExportFailed)?;
+		writer.write_all(&png_bytes).map_err(|_| super::error::Error::PngExportFailed)
 	}
 
-	polylines_to_svg(&mut svg, visible_lines, "black", "", None);
-	polylines_to_svg(&mut svg, hidden_lines, "#bbb", &format!("{dash_len:.4},{dash_gap:.4}"), Some(hidden_sw));
+	/// Render this scene's triangles + edges into an existing pixmap with the
+	/// given transform and stroke widths (in scene units — tiny-skia scales
+	/// them to pixels via the transform). Used by both `write_png` and
+	/// `Mesh::write_multiview_png` (which composites 4 of these into a grid).
+	#[cfg(feature = "png")]
+	pub(crate) fn render_to_pixmap(
+		&self,
+		pixmap: &mut tiny_skia::Pixmap,
+		transform: tiny_skia::Transform,
+		stroke_width: f32,
+		hidden_stroke_width: f32,
+		dash_len: f32,
+		dash_gap: f32,
+	) {
+		use tiny_skia::{FillRule, Paint, PathBuilder, Stroke, StrokeDash};
 
-	svg.push_str("</svg>\n");
-	svg
+		// Triangles (back-to-front, already sorted by Scene2D construction).
+		for (tri, color) in self.triangles.iter().zip(self.color.iter()) {
+			let mut pb = PathBuilder::new();
+			pb.move_to(tri[0].x as f32, tri[0].y as f32);
+			pb.line_to(tri[1].x as f32, tri[1].y as f32);
+			pb.line_to(tri[2].x as f32, tri[2].y as f32);
+			pb.close();
+			if let Some(path) = pb.finish() {
+				let mut paint = Paint::default();
+				paint.set_color_rgba8(color[0], color[1], color[2], 255);
+				paint.anti_alias = true;
+				pixmap.fill_path(&path, &paint, FillRule::Winding, transform, None);
+			}
+		}
+
+		// Visible edges — solid black.
+		let mut visible_paint = Paint::default();
+		visible_paint.set_color_rgba8(0, 0, 0, 255);
+		visible_paint.anti_alias = true;
+		let visible_stroke = Stroke { width: stroke_width, ..Stroke::default() };
+		Self::stroke_polylines(pixmap, &self.edges_visible, &visible_paint, &visible_stroke, transform);
+
+		// Hidden edges — gray dashed.
+		let mut hidden_paint = Paint::default();
+		hidden_paint.set_color_rgba8(0xbb, 0xbb, 0xbb, 255);
+		hidden_paint.anti_alias = true;
+		let hidden_stroke = Stroke {
+			width: hidden_stroke_width,
+			dash: StrokeDash::new(vec![dash_len, dash_gap], 0.0),
+			..Stroke::default()
+		};
+		Self::stroke_polylines(pixmap, &self.edges_hidden, &hidden_paint, &hidden_stroke, transform);
+	}
+
+	#[cfg(feature = "png")]
+	fn stroke_polylines(
+		pixmap: &mut tiny_skia::Pixmap,
+		polylines: &[DVec2],
+		paint: &tiny_skia::Paint,
+		stroke: &tiny_skia::Stroke,
+		transform: tiny_skia::Transform,
+	) {
+		let mut start = 0;
+		for i in 0..=polylines.len() {
+			let is_sep = i == polylines.len() || polylines[i].is_nan();
+			if is_sep {
+				let line = &polylines[start..i];
+				if line.len() >= 2 {
+					let mut pb = tiny_skia::PathBuilder::new();
+					pb.move_to(line[0].x as f32, line[0].y as f32);
+					for p in &line[1..] {
+						pb.line_to(p.x as f32, p.y as f32);
+					}
+					if let Some(path) = pb.finish() {
+						pixmap.stroke_path(&path, paint, stroke, transform, None);
+					}
+				}
+				start = i + 1;
+			}
+		}
+	}
+
+}
+
+// ==================== Mesh::write_multiview_png — fixed 4-view PNG ====================
+//
+// LLM 視覚フィードバック向けの「固定プロトコル」プレビュー。引数を取らず、Solid 1
+// つを 4 視点 (ISO/TOP/FRONT/RIGHT) で 1024×1024 PNG にレンダリングする。すべての
+// 視点は **同一スケール** で描かれ、viewbox は世界原点中心の `[-h, h]²` で固定
+// (h は世界 AABB 角点を全 4 視点で投影した最大絶対座標)。原点との相対位置と相対
+// スケールが画像から読み取れる。下部に単位なしの scale bar、各パネルに gnomon。
+
+impl Mesh {
+	/// Write a fixed-format 4-view preview PNG (1024×1024) to `writer`.
+	///
+	/// レイアウトは固定:
+	/// - 2×2 グリッド: 左上 ISO, 右上 TOP, 左下 FRONT, 右下 RIGHT (Z-up を仮定)
+	/// - 全ビュー共通スケール (原点中心 `[-h, h]²`)
+	/// - 各パネルに world axis gnomon (右下)
+	/// - 画像下部に単位なし scale bar ({1,2,5}×10^n の round value)
+	///
+	/// 引数チューニングが必要な用途では `Mesh::scene → Scene2D::write_png` を使う。
+	/// この関数は LLM への現状確認画像生成という単一目的のための「固定プロトコル」。
+	#[cfg(feature = "png")]
+	pub fn write_multiview_png<W: std::io::Write>(&self, writer: &mut W) -> Result<(), super::error::Error> {
+		use tiny_skia::{Pixmap, Transform};
+
+		const IMG_SIZE: u32 = 1024;
+		const H_SCALE: f64 = 1.05;
+		const GNOMON_SIZE: f32 = 48.0;
+		const GNOMON_INSET: f32 = 24.0;
+		const TICK_SIZE: f32 = 12.0;
+		const LABEL_SIZE: f32 = 16.0;
+
+		// 4 view configs (Z-up convention): (view_dir, up).
+		// `view` points FROM scene TOWARD camera per Mesh::scene's convention.
+		//
+		// パネル配置 (row-major: TL, TR, BL, BR) と視点ベクトルの対応:
+		//
+		//   ┌──────────┬──────────┐
+		//   │ TL (1,1,1│ TR (0,0,1│
+		//   │  = ISO ) │  = +Z 視点)│
+		//   ├──────────┼──────────┤
+		//   │ BL (1,0,0│ BR (0,1,0│
+		//   │  = +X 視点)│  = +Y 視点)│
+		//   └──────────┴──────────┘
+		//
+		// **反時計回りの読み順** (TL → BL → BR → TR) で視点が
+		// `(1,1,1) → (1,0,0) → (0,1,0) → (0,0,1)` の cyclic 順になる:
+		// ISO の後は X→Y→Z の世界軸を順に正面から見ることに対応し、
+		// 工学規格 (第一/第三角法) ではなく **座標軸の cyclic 順** という
+		// より基本的な不変量に揃えた配置。視点識別は gnomon で行うので
+		// テキストラベルは持たない。
+		//
+		// **up の選択**: 各 ortho 視点の +X+Y+Z コーナーがグリッド中央 (ISO 側)
+		// を向くよう up を選ぶ。BL/BR は up=+Z で自然に成立、TR (+Z 視点) のみ
+		// up=-Y にして画面上 +Y を下向きにする必要がある。これにより 4 パネルの
+		// part 配置がグリッド中央を中心とした鏡像構造になる。
+		let views: [(DVec3, DVec3); 4] = [
+			(DVec3::new(1.0, 1.0, 1.0), DVec3::Z),  // TL: ISO
+			(DVec3::Z, -DVec3::Y),                   // TR: +Z 視点 (up=-Y で内向き)
+			(DVec3::X, DVec3::Z),                    // BL: +X 視点
+			(DVec3::Y, DVec3::Z),                    // BR: +Y 視点
+		];
+
+		let bases: [(DVec3, DVec3, DVec3); 4] = std::array::from_fn(|i| projection_basis(views[i].0, views[i].1));
+
+		// 4 視点の Scene2D を先に構築し、各々の `viewbox()` (= 実際に描画される
+		// 前面三角形頂点の bbox) の絶対値最大から共通 h を導く。
+		// 含意: 各パネルは原点中心の `[-h, h]²` を表示し、コンテンツは全パネルで必ず収まる。
+		// 世界 AABB 角投影より tight (球面など曲面で part が panel いっぱいに描かれる)。
+		let scenes: [Scene2D; 4] = std::array::from_fn(|i| self.scene(views[i].0, views[i].1, true, false));
+		let h = scenes.iter()
+			.map(|v| v.viewbox())
+			.flat_map(|[a,b]| [a.x,a.y,b.x,b.y])
+			.map(|x|x.abs()*H_SCALE)
+			.reduce(f64::max)
+			.unwrap_or(1.0);
+
+		// 各パネルは正方形 512×512、4 パネル交点はちょうど画像中心 (512, 512)。
+		// padding なし: part は panel 端まで使い切る。scale bar は y=512 の水平
+		// パネル境界線に 2 つ埋め込む (フッター帯を持たない)。
+		let panel_w = (IMG_SIZE as f32) / 2.0;
+		let panel_h = (IMG_SIZE as f32) / 2.0;
+		let pps = (panel_w.min(panel_h) as f64) / (2.0 * h);
+
+		// 背景は透過。下流で任意色に composite できる。
+		let mut pixmap = Pixmap::new(IMG_SIZE, IMG_SIZE).ok_or(super::error::Error::PngExportFailed)?;
+
+		// Per-panel stroke widths in scene units (tiny-skia transform scales them to px).
+		let stroke_px = 1.5_f32;
+		let scene_stroke = stroke_px / (pps as f32);
+		let scene_hidden_stroke = scene_stroke * 0.6;
+		let scene_dash_len = scene_stroke * 4.0;
+		let scene_dash_gap = scene_stroke * 3.0;
+
+		for (i, scene) in scenes.iter().enumerate() {
+			let (col, row) = (i % 2, i / 2);
+			let px0 = (col as f32) * panel_w;
+			let py0 = (row as f32) * panel_h;
+			let cx = px0 + panel_w / 2.0;
+			let cy = py0 + panel_h / 2.0;
+
+			// Scene→pixel transform: scene-y up → pixel-y down via the `-s` row.
+			let s = pps as f32;
+			let transform = Transform::from_row(s, 0.0, 0.0, -s, cx, cy);
+
+			scene.render_to_pixmap(&mut pixmap, transform, scene_stroke, scene_hidden_stroke, scene_dash_len, scene_dash_gap);
+
+			// Gnomon (bottom-right corner of panel) — also serves as view identifier.
+			let (u_basis, v_basis, _) = bases[i];
+			let g_origin = (px0 + panel_w - GNOMON_SIZE - GNOMON_INSET, py0 + panel_h - GNOMON_SIZE - GNOMON_INSET);
+			draw_gnomon(&mut pixmap, g_origin, GNOMON_SIZE, LABEL_SIZE, u_basis, v_basis);
+		}
+
+		// 4 パネルを区切る十字線 (light gray)。中央の縦横 2 本だけ、外周は画像端と一致するので描かない。
+		preview_path(&mut pixmap, [
+			[0.0, panel_h, IMG_SIZE as f32, panel_h],
+			[panel_w, 0.0, panel_w, IMG_SIZE as f32],
+		], 0xcccccc, 1.0);
+
+		// Scale bars embedded on the y=panel_h horizontal panel boundary.
+		// 左半分にメインスケール、右半分にサブスケールを配置。大小 2 つの reference を
+		// 与えることで LLM が任意長さを推定しやすくなる。
+		//
+		// 係数の理屈: bar_px = step × pps、pps = usable / (2h) なので step = 2h で
+		// bar_px = usable (= padding 込みの最大幅)。よって 1.6h で ~80% 幅のメイン bar、
+		// その半分 0.8h でサブ bar (nice_step は round-down なので bar は target 以下)。
+		let step1 = nice_step(h * 1.6);
+		let step2 = nice_step(h * 0.7);
+		let boundary_y = panel_h;  // = 512
+		for (step, center_x) in [(step1, panel_w / 2.0), (step2, panel_w * 1.5)] {
+			let bar_px = (step * pps) as f32;
+			let x0 = center_x - bar_px / 2.0;
+			let x1 = center_x + bar_px / 2.0;
+			// scale bar: 横棒 + 両端 tick の 3 セグメント
+			preview_path(&mut pixmap, [
+				[x0, boundary_y, x1, boundary_y],
+				[x0, boundary_y - TICK_SIZE / 2.0, x0, boundary_y + TICK_SIZE / 2.0],
+				[x1, boundary_y - TICK_SIZE / 2.0, x1, boundary_y + TICK_SIZE / 2.0],
+			], 0x1f3a8a, 2.0);
+			let label = format!("{}", step);
+			let glyph_w = LABEL_SIZE * 0.6;
+			let text_w = (label.chars().count() as f32) * glyph_w * 1.2 - glyph_w * 0.2;
+			draw_text(&mut pixmap, &label, center_x - text_w / 2.0, boundary_y - LABEL_SIZE - 4.0, LABEL_SIZE, 0x1f3a8a);
+		}
+
+		let png_bytes = pixmap.encode_png().map_err(|_| super::error::Error::PngExportFailed)?;
+		writer.write_all(&png_bytes).map_err(|_| super::error::Error::PngExportFailed)
+	}
+}
+
+// ==================== Preview helpers (scale / overlay drawing) ====================
+
+/// Glyph/label size in pixels. Shared between scale-bar labels and gnomon axis labels.
+
+/// Largest `{1, 2, 5} × 10^n` value ≤ `target` (round-down). Used for scale-bar
+/// length so the bar is guaranteed not to exceed the requested target size.
+fn nice_step(target: f64) -> f64 {
+	if !target.is_finite() || target <= 0.0 {
+		return 1.0;
+	}
+	let exp = target.log10().floor() as i32;
+	let pow = 10f64.powi(exp);
+	let m = target / pow;
+	let nice = if m < 2.0 { 1.0 } else if m < 5.0 { 2.0 } else { 5.0 };
+	nice * pow
+}
+
+// ---- Glyph paths (single polyline per glyph, in unit square; y=0 bottom, y=1 top) ----
+//
+// 各文字は **1 本のポリライン** で表現。出現しうる文字だけ収録。フォント crate を引かず
+// PathBuilder の move_to/line_to だけで描く。
+//
+// - scale bar: `nice_step` が `{1,2,5} × 10^n` のみ返すため、format 結果に出る数字は `0, 1, 2, 5` と小数点 `.` の 5 種類。
+// - gnomon: 世界軸ラベル `X, Y, Z` の 3 種類。
+//
+// 'X' と 'Y' は内部分岐があり厳密な Eulerian 一筆書きではないが、ポリライン上で中央
+// を 2 度通る (重ね描き) ことで単一列に詰めている — AA 描画では重ね描きと 1 度描きが
+// 視覚的に同一なので問題ない。'1' は base を持たず stem + flag のみで認識可能とした。
+fn glyph_polyline(c: char) -> &'static [[f32; 2]] {
+	match c {
+		'0' => &[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0],[0.0,0.0]],
+		'1' => &[[0.2,0.8],[0.5,1.0],[0.5,0.0]],
+		'2' => &[[0.0,1.0],[1.0,1.0],[1.0,0.5],[0.0,0.5],[0.0,0.0],[1.0,0.0]],
+		'5' => &[[1.0,1.0],[0.0,1.0],[0.0,0.5],[1.0,0.5],[1.0,0.0],[0.0,0.0]],
+		'.' => &[[0.4,0.0],[0.6,0.0],[0.6,0.15],[0.4,0.15],[0.4,0.0]],
+		'X' => &[[0.0,0.0],[1.0,1.0],[0.5,0.5],[0.0,1.0],[1.0,0.0]],
+		'Y' => &[[0.0,1.0],[0.5,0.5],[0.5,0.0],[0.5,0.5],[1.0,1.0]],
+		'Z' => &[[0.0,1.0],[1.0,1.0],[0.0,0.0],[1.0,0.0]],
+		_ => &[],
+	}
+}
+
+/// Stroke a list of line segments as a single anti-aliased path.
+/// Preview UI 用の唯一の描画プリミティブ — gnomon / 十字線 / scale bar / glyph 文字
+/// すべてこの 1 関数を経由する。`color` は `0xRRGGBB` (full alpha)。
+#[cfg(feature = "png")]
+fn preview_path(pixmap: &mut tiny_skia::Pixmap, segments: impl IntoIterator<Item = [f32; 4]>, color: u32, stroke_width: f32) {
+	use tiny_skia::{Paint, PathBuilder, Stroke, Transform};
+	let mut pb = PathBuilder::new();
+	for [x0, y0, x1, y1] in segments {
+		pb.move_to(x0, y0);
+		pb.line_to(x1, y1);
+	}
+	let Some(path) = pb.finish() else { return };
+	let mut paint = Paint::default();
+	paint.set_color_rgba8(((color >> 16) & 0xff) as u8, ((color >> 8) & 0xff) as u8, (color & 0xff) as u8, 255);
+	paint.anti_alias = true;
+	let stroke = Stroke { width: stroke_width, ..Stroke::default() };
+	pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+}
+
+/// Draw `text` with top-left at `(x, y)` in pixel space. Glyph y is flipped
+/// internally so y=1 in unit-space maps to the top of the line and y=0 to the
+/// bottom (pixel-y points down).
+#[cfg(feature = "png")]
+fn draw_text(pixmap: &mut tiny_skia::Pixmap, text: &str, x: f32, y: f32, size: f32, color: u32) {
+	let glyph_w = size * 0.6;
+	let advance = glyph_w * 1.2;
+	let mut segments: Vec<[f32; 4]> = Vec::new();
+	let mut cursor = x;
+	for ch in text.chars() {
+		for w in glyph_polyline(ch).windows(2) {
+			segments.push([
+				cursor + w[0][0] * glyph_w, y + (1.0 - w[0][1]) * size,
+				cursor + w[1][0] * glyph_w, y + (1.0 - w[1][1]) * size,
+			]);
+		}
+		cursor += advance;
+	}
+	preview_path(pixmap, segments, color, (size * 0.1).max(1.0));
+}
+
+/// Draw a 3-axis gnomon at `origin` (pixel coords, top-left of gnomon bounding
+/// box). Each axis projects to 2D via `u`/`v` and is drawn as a short arrow
+/// labeled X/Y/Z. Axes with near-zero projected length are skipped (they're
+/// pointing into/out of the screen).
+#[cfg(feature = "png")]
+fn draw_gnomon(pixmap: &mut tiny_skia::Pixmap, origin: (f32, f32), size: f32, text_size: f32, u: DVec3, v: DVec3) {
+	let cx = origin.0 + size / 2.0;
+	let cy = origin.1 + size / 2.0;
+	let axes: [(DVec3, &str, u32); 3] = [
+		(DVec3::X, "X", 0xc0392b),
+		(DVec3::Y, "Y", 0x27ae60),
+		(DVec3::Z, "Z", 0x2980b9),
+	];
+	for (axis, label, color) in axes {
+		let p = DVec2::new(axis.dot(u), axis.dot(v));
+		let len = p.length();
+		if len < 0.15 {
+			// 軸が画面に対しほぼ垂直 → 点になるだけなので描画スキップ
+			continue;
+		}
+		let ex = cx + (p.x as f32) * (size / 2.0);
+		// pixel-y is down, scene-y is up → flip
+		let ey = cy - (p.y as f32) * (size / 2.0);
+		preview_path(pixmap, [[cx, cy, ex, ey]], color, 1.5);
+
+		// Label past the arrow tip in the same direction.
+		// label_off >= text_size/2 (= glyph 半高) でないと vertical な軸でラベルが線に被る。
+		// text_size と同値にして 6 px 程度のクリアランスを確保する。
+		let label_off = text_size;
+		let dir_x = (ex - cx) / (len.max(1e-9) as f32 * (size / 2.0));
+		let dir_y = (ey - cy) / (len.max(1e-9) as f32 * (size / 2.0));
+		let lx = ex + dir_x * label_off - text_size * 0.3;
+		let ly = ey + dir_y * label_off - text_size * 0.5;
+		draw_text(pixmap, label, lx, ly, text_size, color);
+	}
 }

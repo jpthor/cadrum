@@ -1,9 +1,9 @@
 //! Build a chijin (hand drum from Amami Oshima) with colors, boolean ops, and SVG export.
 
-use cadrum::{Color, Compound, DVec3, Edge, ProfileOrient, Solid};
+use cadrum::{Color, DVec3, Edge, ProfileOrient, Solid};
 use std::f64::consts::PI;
 
-pub fn chijin() -> Result<Solid, cadrum::Error> {
+fn chijin() -> Result<Solid, cadrum::Error> {
 	// ── Body (cylinder): r=15, h=8, centered at origin (z=-4..+4) ────────
 	let cylinder = Solid::cylinder(15.0, DVec3::Z, 8.0)
 		.translate(DVec3::Z * -4.0)
@@ -45,24 +45,25 @@ pub fn chijin() -> Result<Solid, cadrum::Error> {
 	let blocks: [Solid; N] = std::array::from_fn(|i| block_proto.clone().rotate_z(angle(i)).color(color(i)));
 	let holes: [Solid; N] = std::array::from_fn(|i| hole_proto.clone().rotate_z(angle(i)));
 	// ── Assemble with boolean operations: union, subtract, union ─────────
-	let result = [cylinder]
-		.union(&sheets)?
-		.subtract(&holes)?
-		.union(&blocks)?;
-	assert!(result.len() == 1);
-	Ok(result.into_iter().next().unwrap())
+	let mut result: Solid = (&cylinder + &sheets[0] + &sheets[1]).build()?;
+	for i in 0..N{
+		result = (&result - &holes[i] + &blocks[i]).build()?;
+	}
+	Ok(result)
 }
 
 fn main() -> Result<(), cadrum::Error> {
 	let example_name = std::path::Path::new(file!()).file_stem().unwrap().to_str().unwrap();
 	let result = [chijin()?];
 
-	let mut f = std::fs::File::create(format!("{example_name}.step")).expect("failed to create STEP file");
-	Solid::write_step(&result, &mut f).expect("failed to write STEP");
+	Solid::write_step(&result, &mut std::fs::File::create(format!("{example_name}.step")).unwrap())?;
 
-	let mut f = std::fs::File::create(format!("{example_name}.svg")).expect("failed to create SVG file");
-	Solid::mesh(&result, 0.5).and_then(|m| m.write_svg(DVec3::ONE, DVec3::Z, true, false, &mut f)).expect("failed to write SVG");
+	let scene = Solid::mesh(&result, 0.5)?.scene(DVec3::ONE, DVec3::Y, true, false);
+	scene.write_svg(&mut std::fs::File::create(format!("{example_name}.svg")).unwrap())?;
+	scene.write_png([1280 , 640], &mut std::fs::File::create(format!("{example_name}.png")).unwrap())?;
+	// This size 1280 x 640 is special because 00_chijin.png is used for github repository social media preview image.
+	// > we recommend a size of at least 640 by 320 pixels (1280 by 640 pixels for best display).　See https://docs.github.com/ja/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/customizing-your-repositorys-social-media-preview
 
-	println!("wrote {example_name}.step / {example_name}.svg");
+	println!("wrote {example_name}.step / {example_name}.svg / {example_name}.png");
 	Ok(())
 }

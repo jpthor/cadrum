@@ -1,4 +1,4 @@
-use cadrum::{Compound, Solid};
+use cadrum::{Solid};
 use glam::DVec3;
 
 fn dvec3(x: f64, y: f64, z: f64) -> DVec3 {
@@ -10,7 +10,7 @@ fn svg_string(shape: &[Solid], direction: DVec3, tol: f64) -> String {
 	// Pick a sensible up for each view: Z-up for oblique/side views,
 	// Y-up when looking straight down Z (view_dir ‖ Z would make Z-up degenerate).
 	let up = if direction.normalize().dot(DVec3::Z).abs() > 0.999 { DVec3::Y } else { DVec3::Z };
-	cadrum::Solid::mesh(shape, tol).and_then(|m| m.write_svg(direction, up, true, false, &mut buf)).unwrap();
+	cadrum::Solid::mesh(shape, tol).and_then(|m| m.scene(direction, up, true, false).write_svg(&mut buf)).unwrap();
 	String::from_utf8(buf).unwrap()
 }
 
@@ -58,7 +58,7 @@ fn test_svg_cylinder() {
 fn test_svg_has_hidden_lines() {
 	let a = [Solid::cube(10.0, 10.0, 10.0)];
 	let b = [Solid::cube(10.0, 10.0, 10.0).translate(dvec3(5.0, 5.0, 0.0))];
-	let shape: Vec<Solid> = a.union(&b).unwrap();
+	let shape: Vec<Solid> = (&a[0] + &b[0]).build_vec().unwrap();
 	let svg = svg_string(&shape, dvec3(1.0, 1.0, 1.0).normalize(), 0.1);
 
 	assert!(svg.contains("#bbb"), "should contain hidden line color");
@@ -80,7 +80,7 @@ fn test_svg_rotated_sphere_face_count_stable() {
 	let svg_a = svg_string(&shape, DVec3::X, 0.1);
 	let count_a = count_polygons(&svg_a);
 
-	let rotated = shape.rotate_y(std::f64::consts::PI);
+	let rotated = shape.map(|s| s.rotate_y(std::f64::consts::PI));
 	let svg_b = svg_string(&rotated, DVec3::X, 0.1);
 	let count_b = count_polygons(&svg_b);
 

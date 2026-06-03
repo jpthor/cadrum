@@ -18,7 +18,7 @@ fn write_outputs(solids: &[Solid], name: &str) {
 	let mut f = std::fs::File::create(format!("out/{name}.stl")).unwrap();
 	cadrum::Solid::mesh(solids, 0.1).and_then(|m| m.write_stl(&mut f)).expect("stl write");
 	let mut f = std::fs::File::create(format!("out/{name}.svg")).unwrap();
-	cadrum::Solid::mesh(solids, 0.5).and_then(|m| m.write_svg(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, false, &mut f)).expect("svg write");
+	cadrum::Solid::mesh(solids, 0.5).and_then(|m| m.scene(DVec3::new(1.0, 1.0, 2.0), DVec3::Z, true, false).write_svg(&mut f)).expect("svg write");
 }
 
 /// XZ 平面(法線 Y)と YZ 平面(法線 X)で 4 象限に分割し、180° 回転対称
@@ -33,9 +33,12 @@ fn assert_quadrant_point_symmetry(solid: &Solid, tol: f64) {
 	let plus_y = Solid::half_space(DVec3::ZERO, DVec3::Y);
 	let minus_y = Solid::half_space(DVec3::ZERO, -DVec3::Y);
 
+	// half_space × half_space の連鎖 intersect は CellsBuilder が
+	// 「半無限 cell」を生成する場合に空結果を返すので、逐次 intersect で
+	// 1 段ずつ評価する必要がある。
 	let quadrant = |hs1: &Solid, hs2: &Solid| -> f64 {
-		let ab = Solid::boolean_intersect(std::slice::from_ref(solid), std::slice::from_ref(hs1)).expect("intersect hs1");
-		let q = Solid::boolean_intersect(&ab, std::slice::from_ref(hs2)).expect("intersect hs2");
+		let ab: Solid = (solid * hs1).build().expect("intersect hs1");
+		let q: Vec<Solid> = (&ab * hs2).build_vec().expect("intersect hs2");
 		q.iter().map(|s| s.volume()).sum::<f64>()
 	};
 

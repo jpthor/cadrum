@@ -6,14 +6,14 @@
 //! 各テスト名の `t0N` は合格基準番号に対応:
 //!   T-01: Bug 1 — ブール演算結果の drop 順序で STATUS_HEAP_CORRUPTION が起きない
 //!   T-02: Bug 2 — read_step 複数回呼び出し後にプロセスが正常終了する
-//!   T-03: Bug 3 — mesh.normals.len() == mesh.vertices.len()（法線 off-by-one）
+//!   T-03: 廃止（Mesh::normals フィールド削除に伴い検証対象が消滅）
 //!   T-04: Bug 4 — approximation_segments の tolerance が反映される（ハードコード脱却）
 //!   T-05: Bug 5 — union 後コンパウンドへの平行移動が全頂点に正確に反映される
 //!   T-06: I/O  — BRep バイナリの write→read ラウンドトリップ
 //!   T-07: I/O  — read/write 中に一時ファイルが生成されない（ストリームAPI）
 //!   T-08: API設計 — boolean の戻り値が中間型でなく Shape（現 Vec<Solid>）に変換可能
 
-use cadrum::{Compound, Solid};
+use cadrum::Solid;
 use glam::DVec3;
 
 fn dvec3(x: f64, y: f64, z: f64) -> DVec3 {
@@ -48,7 +48,7 @@ fn shape_to_brep_bytes<'a>(shape: impl IntoIterator<Item = &'a Solid>) -> Vec<u8
 fn test_t01_union_drop_result_first() {
 	let a = test_box();
 	let b = test_box_2();
-	let result = a.union([&b]).unwrap();
+	let result: Vec<Solid> = (&a + &b).build_vec().unwrap();
 	drop(result);
 	drop(a);
 	drop(b);
@@ -58,7 +58,7 @@ fn test_t01_union_drop_result_first() {
 fn test_t01_union_drop_result_last() {
 	let a = test_box();
 	let b = test_box_2();
-	let result = a.union([&b]).unwrap();
+	let result: Vec<Solid> = (&a + &b).build_vec().unwrap();
 	drop(a);
 	drop(b);
 	drop(result);
@@ -68,7 +68,7 @@ fn test_t01_union_drop_result_last() {
 fn test_t01_subtract_drop_order() {
 	let a = test_box();
 	let b = test_box_2();
-	let result = a.subtract([&b]).unwrap();
+	let result: Vec<Solid> = (&a - &b).build_vec().unwrap();
 	drop(a);
 	drop(b);
 	drop(result);
@@ -78,7 +78,7 @@ fn test_t01_subtract_drop_order() {
 fn test_t01_intersect_drop_order() {
 	let a = test_box();
 	let b = test_box_2();
-	let result = a.intersect([&b]).unwrap();
+	let result: Vec<Solid> = (&a * &b).build_vec().unwrap();
 	drop(a);
 	drop(b);
 	drop(result);
@@ -89,8 +89,8 @@ fn test_t01_chained_boolean_drops() {
 	let a = test_box();
 	let b = test_box_2();
 	let c = test_box_3();
-	let r1 = a.union([&b]).unwrap();
-	let r2 = r1.subtract([&c]).unwrap();
+	let r1: Solid = (&a + &b).build().unwrap();
+	let r2: Solid = (&r1 - &c).build().unwrap();
 	drop(r1);
 	drop(r2);
 	drop(a);
@@ -111,17 +111,6 @@ fn test_t02_multiple_reads_no_crash() {
 	for _ in 0..5 {
 		let _shape = cadrum::Solid::read_brep_binary(&mut brep_data.as_slice()).unwrap();
 	}
-}
-
-// ==================== T-03: Mesh normals count ====================
-// Bug 3: 法線ループで normal_array.Length()（キャパシティ=頂点数+1）を上限に
-// 使っていたため normals が vertices より1つ少なかった。
-
-#[test]
-fn test_t03_mesh_normals_count() {
-	let shape = test_box();
-	let mesh = cadrum::Solid::mesh(&[shape], 0.1).unwrap();
-	assert_eq!(mesh.normals.len(), mesh.vertices.len());
 }
 
 // ==================== T-04: Approximation tolerance ====================
@@ -150,7 +139,7 @@ fn test_t04_approximation_tolerance() {
 fn test_t05_translated_compound() {
 	let a = test_box();
 	let b = test_box_2();
-	let compound = a.union([&b]).unwrap();
+	let compound: Vec<Solid> = (&a + &b).build_vec().unwrap();
 	let v = dvec3(100.0, 0.0, 0.0);
 	let orig_mesh = cadrum::Solid::mesh(&compound, 0.1).unwrap();
 	let shifted: Vec<Solid> = compound.into_iter().map(|s| s.translate(v)).collect();
@@ -191,9 +180,9 @@ fn test_t06_brep_roundtrip() {
 fn test_t08_boolean_returns_shape() {
 	let a = test_box();
 	let b = test_box_2();
-	let _union: Vec<Solid> = a.union([&b]).unwrap();
-	let _sub: Vec<Solid> = a.subtract([&b]).unwrap();
-	let _inter: Vec<Solid> = a.intersect([&b]).unwrap();
+	let _union: Vec<Solid> = (&a + &b).build_vec().unwrap();
+	let _sub: Vec<Solid> = (&a - &b).build_vec().unwrap();
+	let _inter: Vec<Solid> = (&a * &b).build_vec().unwrap();
 }
 
 // ==================== STEP export ====================
@@ -203,7 +192,7 @@ fn test_t08_boolean_returns_shape() {
 fn test_hollow_cube_write_step() {
 	let outer = [Solid::cube(20.0, 20.0, 20.0).translate(dvec3(-10.0, -10.0, -10.0))];
 	let inner = [Solid::cube(10.0, 10.0, 10.0).translate(dvec3(-5.0, -5.0, -5.0))];
-	let hollow_cube = outer.subtract(&inner).unwrap();
+	let hollow_cube: Vec<Solid> = (&outer[0] - &inner[0]).build_vec().unwrap();
 
 	std::fs::create_dir_all("out").unwrap();
 	let mut file = std::fs::File::create("out/hollow_cube.step").unwrap();
@@ -215,7 +204,7 @@ fn test_hollow_cube_write_step() {
 fn test_half_space_intersect() {
 	let shape = test_box();
 	let half = [Solid::half_space(dvec3(5.0, 0.0, 0.0), dvec3(1.0, 0.0, 0.0))];
-	let result = shape.intersect(&half).unwrap();
+	let result: Vec<Solid> = (&shape * &half[0]).build_vec().unwrap();
 	assert!(!result.iter().all(|s| s.is_null()));
 }
 
